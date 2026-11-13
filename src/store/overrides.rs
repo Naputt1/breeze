@@ -75,6 +75,21 @@ impl OverridesFile {
         super::write_json(path, self)
     }
 
+    /// Insert or replace an entry, keyed by path and layer.
+    pub fn upsert(&mut self, entry: OverrideEntry) {
+        if let Some(existing) = self
+            .overrides
+            .iter_mut()
+            .find(|candidate| candidate.path == entry.path && candidate.layer == entry.layer)
+        {
+            let created_at = existing.created_at.clone();
+            *existing = entry;
+            existing.created_at = created_at;
+        } else {
+            self.overrides.push(entry);
+        }
+    }
+
     /// Number of link and patch entries.
     pub fn counts(&self) -> (usize, usize) {
         let mut links = 0;
