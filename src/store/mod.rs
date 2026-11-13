@@ -4,6 +4,7 @@ pub mod exclude;
 pub mod identity;
 pub mod overlay;
 pub mod overrides;
+pub mod patches;
 
 use std::fs;
 use std::io::Write;

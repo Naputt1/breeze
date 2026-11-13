@@ -1,4 +1,4 @@
-//! `breeze sync` — repair overlay symlinks.
+//! `breeze sync` — apply stored patches and repair overlay symlinks.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -8,32 +8,37 @@ use anyhow::Result;
 use crate::cli::SyncArgs;
 use crate::commands::Ctx;
 use crate::exit;
+use crate::store::now_rfc3339;
 use crate::store::overlay::{self, Repo};
 use crate::store::overrides::{OverrideEntry, OverrideMode};
+use crate::store::patches;
 
 pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
     let overrides = repo.overrides()?;
-    let mut entries: Vec<OverrideEntry> = overrides
+    let (mut links, mut patches): (Vec<OverrideEntry>, Vec<OverrideEntry>) = overrides
         .overrides
         .into_iter()
-        .filter(|entry| entry.mode == OverrideMode::Link)
-        .collect();
+        .partition(|entry| entry.mode == OverrideMode::Link);
 
-    if let Some(path) = &args.path {
-        let relative = overlay::relative_lenient_path(&repo, path)?;
-        entries.retain(|entry| entry.path == relative);
-        if entries.is_empty() {
+    let filter = match &args.path {
+        Some(path) => Some(overlay::relative_lenient_path(&repo, path)?),
+        None => None,
+    };
+    if let Some(path) = &filter {
+        links.retain(|entry| &entry.path == path);
+        patches.retain(|entry| &entry.path == path);
+        if links.is_empty() && patches.is_empty() {
             if !ctx.quiet {
-                println!("no link overlays recorded for {relative}");
+                println!("no overlays recorded for {path}");
             }
             return Ok(exit::SUCCESS);
         }
     }
 
-    if entries.is_empty() {
+    if links.is_empty() && patches.is_empty() {
         if !ctx.quiet {
-            println!("no link overlays recorded");
+            println!("no overlays recorded");
         }
         return Ok(exit::SUCCESS);
     }
@@ -44,13 +49,29 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
         vec![repo.current_target()]
     };
 
-    let paths: BTreeSet<String> = entries.iter().map(|entry| entry.path.clone()).collect();
-    let mut failures = 0;
-    let mut changes = 0;
+    let mut failures = 0usize;
+    let mut conflicts = 0usize;
+    let mut changes = 0usize;
 
-    for path in &paths {
+    for path in &entry_paths(&patches) {
         let path_entries: Vec<&OverrideEntry> =
-            entries.iter().filter(|entry| &entry.path == path).collect();
+            patches.iter().filter(|entry| &entry.path == path).collect();
+        for target in &targets {
+            match sync_patch(&repo, path, &path_entries, target, args.dry_run) {
+                Ok(PatchChange::Unchanged) => {}
+                Ok(PatchChange::Applied) => changes += 1,
+                Ok(PatchChange::Conflict) => conflicts += 1,
+                Err(err) => {
+                    eprintln!("error: failed to sync `{path}`: {err:#}");
+                    failures += 1;
+                }
+            }
+        }
+    }
+
+    for path in &entry_paths(&links) {
+        let path_entries: Vec<&OverrideEntry> =
+            links.iter().filter(|entry| &entry.path == path).collect();
 
         for target in &targets {
             let Some(entry) = overlay::best_entry(path_entries.iter().copied(), target) else {
@@ -131,20 +152,87 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
         }
     }
 
-    if changes == 0 && failures == 0 && !ctx.quiet {
-        println!("all links ok");
+    if changes == 0 && failures == 0 && conflicts == 0 && !ctx.quiet {
+        println!("all overlays ok");
     }
 
-    Ok(if failures > 0 {
+    Ok(if conflicts > 0 {
+        exit::PATCH_CONFLICT
+    } else if failures > 0 {
         exit::GENERAL
     } else {
         exit::SUCCESS
     })
 }
 
+enum PatchChange {
+    Unchanged,
+    Applied,
+    Conflict,
+}
+
+fn sync_patch(
+    repo: &Repo,
+    path: &str,
+    entries: &[&OverrideEntry],
+    target: &overlay::WorktreeTarget,
+    dry_run: bool,
+) -> Result<PatchChange> {
+    let Some(entry) = overlay::best_entry(entries.iter().copied(), target) else {
+        return Ok(PatchChange::Unchanged);
+    };
+
+    let patch_file = repo.layout.repo_dir.join(&entry.source);
+    if !patch_file.is_file() {
+        anyhow::bail!("store patch is missing ({})", patch_file.display());
+    }
+    let meta_file = patches::metadata_path_for(&patch_file)?;
+    let metadata = patches::read_metadata(&meta_file)?;
+
+    let file = target.path.join(path);
+    let current_hash = patches::file_hash(&file);
+    if current_hash.as_deref() == Some(metadata.applied_hash.as_str()) {
+        return Ok(PatchChange::Unchanged);
+    }
+
+    if dry_run {
+        println!("would apply patch {path} in {}", target.path.display());
+        return Ok(PatchChange::Applied);
+    }
+
+    match patches::apply_patch(&target.path, &patch_file, path)? {
+        patches::ApplyOutcome::Clean => {
+            let applied = patches::file_hash(&file).unwrap_or(metadata.applied_hash.clone());
+            let updated = patches::PatchMetadata {
+                applied_hash: applied,
+                updated_at: now_rfc3339(),
+                ..metadata
+            };
+            patches::write_metadata(&meta_file, &updated)?;
+            println!("applied patch {path} in {}", target.path.display());
+            Ok(PatchChange::Applied)
+        }
+        patches::ApplyOutcome::Conflicted => {
+            println!(
+                "CONFLICT {path} in {} (conflict markers written)",
+                target.path.display()
+            );
+            Ok(PatchChange::Conflict)
+        }
+    }
+}
+
+fn entry_paths(entries: &[OverrideEntry]) -> BTreeSet<String> {
+    entries.iter().map(|entry| entry.path.clone()).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::store::overlay::testutil::TempRepo;
+
+    use crate::commands::edit::tests::{commit_file, write_editor};
 
     #[test]
     fn sync_repairs_missing_and_broken_links_and_dry_run_changes_nothing() {
@@ -201,5 +289,55 @@ mod tests {
 
         // Default scope is the current worktree only: no error there.
         repo.breeze_ok(&["sync", "--path", "data.txt"]);
+    }
+
+    #[test]
+    fn sync_applies_a_shared_patch_to_a_second_worktree_and_skips_when_current() {
+        let repo = TempRepo::new("sync-patch-clean");
+        commit_file(&repo, "fog.json", "one\ntwo\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+
+        let editor = write_editor(
+            &repo,
+            "sync-patch-add",
+            "printf 'one\\ntwo\\nlocal\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+
+        let dry = repo.breeze_ok(&["sync", "--all", "--dry-run"]);
+        assert!(dry.contains("would apply patch fog.json"), "{dry}");
+        assert_eq!(repo.read(&repo.other, "fog.json"), "one\ntwo\n");
+
+        let output = repo.breeze_ok(&["sync", "--all"]);
+        assert!(output.contains("applied patch fog.json"), "{output}");
+        assert_eq!(repo.read(&repo.other, "fog.json"), "one\ntwo\nlocal\n");
+
+        // A second run is a no-op: the applied hash matches.
+        let again = repo.breeze_ok(&["sync", "--all"]);
+        assert!(again.contains("all overlays ok"), "{again}");
+    }
+
+    #[test]
+    fn sync_writes_conflict_markers_and_exits_three_on_diverged_targets() {
+        let repo = TempRepo::new("sync-patch-conflict");
+        commit_file(&repo, "fog.json", "one\ntwo\nthree\nfour\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+
+        let editor = write_editor(
+            &repo,
+            "sync-conflict-edit",
+            "printf 'one\\ntwo-local\\nthree\\nfour\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+
+        // Unrelated edit at the same location in the second worktree.
+        fs::write(repo.other.join("fog.json"), "one\ntwo-other\nthree\nfour\n").unwrap();
+
+        let (code, _stderr) = repo.breeze_err(&["sync", "--all"]);
+        assert_eq!(code, 3);
+
+        let contents = repo.read(&repo.other, "fog.json");
+        assert!(contents.contains("<<<<<<<"), "{contents}");
+        assert!(contents.contains(">>>>>>>"), "{contents}");
     }
 }

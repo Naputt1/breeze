@@ -1,6 +1,6 @@
 //! `breeze doctor` — check the store and overlays for problems.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,8 +10,9 @@ use crate::cli::DoctorArgs;
 use crate::commands::Ctx;
 use crate::exit;
 use crate::store::exclude;
-use crate::store::overlay::{self, Repo};
-use crate::store::overrides::{OverrideEntry, OverrideMode};
+use crate::store::overlay::{self, Layer, Repo};
+use crate::store::overrides::{OverrideEntry, OverrideMode, OverridesFile};
+use crate::store::patches;
 
 pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
@@ -129,6 +130,8 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
         }
     }
 
+    problems += check_patches(&repo, &overrides)?;
+
     let known: HashSet<String> = overrides
         .overrides
         .iter()
@@ -178,6 +181,83 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
     } else {
         exit::SUCCESS
     })
+}
+
+/// Check stored patches for missing data, duplicate layers and a stale base.
+fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
+    let mut grouped: BTreeMap<String, Vec<&OverrideEntry>> = BTreeMap::new();
+    for entry in overrides
+        .overrides
+        .iter()
+        .filter(|entry| entry.mode == OverrideMode::Patch)
+    {
+        grouped.entry(entry.path.clone()).or_default().push(entry);
+    }
+
+    let mut problems = 0usize;
+    for (path, entries) in &grouped {
+        if entries.len() > 1 {
+            let layers: Vec<&str> = entries.iter().map(|entry| entry.layer.as_str()).collect();
+            println!(
+                "WARN {path} has duplicate patch overrides in layers {}; keep one layer or run `breeze promote {path}`",
+                layers.join(", ")
+            );
+            problems += 1;
+        }
+
+        let Some(entry) = entries
+            .iter()
+            .max_by_key(|entry| Layer::from_name(&entry.layer))
+        else {
+            continue;
+        };
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        if !patch_file.is_file() {
+            println!(
+                "BROKEN {path} patch file is missing: {}",
+                patch_file.display()
+            );
+            problems += 1;
+            continue;
+        }
+
+        let meta_path = match patches::metadata_path_for(&patch_file) {
+            Ok(path) => path,
+            Err(err) => {
+                println!("BROKEN {path} patch metadata path is invalid: {err}");
+                problems += 1;
+                continue;
+            }
+        };
+        let metadata = match patches::read_metadata(&meta_path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                println!(
+                    "BROKEN {path} patch metadata is missing or invalid: {}",
+                    meta_path.display()
+                );
+                problems += 1;
+                continue;
+            }
+        };
+
+        let object_ok = patches::blob_exists(&repo.info.root, &metadata.base_blob).unwrap_or(false);
+        let head_blob = patches::head_blob(&repo.info.root, path)?;
+        let head_matches = head_blob.as_deref() == Some(metadata.base_blob.as_str());
+        if !object_ok || !head_matches {
+            let base = patches::short(&metadata.base_blob);
+            let current = head_blob
+                .as_deref()
+                .map(patches::short)
+                .unwrap_or("(missing at HEAD)");
+            println!(
+                "STALE {path} patch base {base} no longer matches HEAD {current}; re-run `breeze edit {path}`"
+            );
+            problems += 1;
+        }
+    }
+
+    Ok(problems)
 }
 
 #[cfg(unix)]
@@ -297,6 +377,31 @@ mod tests {
         );
 
         repo.breeze_ok(&["doctor"]);
+    }
+
+    #[test]
+    fn doctor_flags_a_stale_patch_base_after_amend() {
+        let repo = TempRepo::new("doctor-stale");
+        crate::commands::edit::tests::commit_file(&repo, "fog.json", "base\none\n");
+        let editor = crate::commands::edit::tests::write_editor(
+            &repo,
+            "doctor-stale-edit",
+            "printf 'base\\nlocal\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--editor", &editor]);
+        repo.breeze_ok(&["doctor"]);
+
+        // Rewrite the commit under the patch, so the recorded base blob no
+        // longer matches the version at HEAD.
+        repo.write("fog.json", "base\namended\n");
+        repo.git(&repo.main, &["add", "fog.json"]);
+        repo.git(&repo.main, &["commit", "--amend", "--no-edit"]);
+
+        let output = repo.breeze(&["doctor"]);
+        assert_eq!(output.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("STALE fog.json"), "{stdout}");
+        assert!(stdout.contains("re-run `breeze edit fog.json`"), "{stdout}");
     }
 
     #[test]
