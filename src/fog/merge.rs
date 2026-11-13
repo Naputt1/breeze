@@ -575,11 +575,18 @@ mod tests {
                 let Some(name) = overlay_entry.get("name").and_then(Value::as_str) else {
                     continue;
                 };
+                // Duplicate names in one overlay resolve last-wins, so the
+                // expected port comes from the last overlay entry with `name`.
+                let expected = overlay_entries
+                    .iter()
+                    .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
+                    .last()
+                    .and_then(|entry| entry.get("port"));
                 let found = entries
                     .iter()
                     .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
                     .unwrap_or_else(|| panic!("missing merged service entry {name}"));
-                prop_assert_eq!(found.get("port"), overlay_entry.get("port"));
+                prop_assert_eq!(found.get("port"), expected);
             }
         }
     }
