@@ -48,7 +48,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Promote(_) => promote::run(&ctx),
         Command::Env(args) => env::run(&ctx, &args),
         Command::Run(args) => run::run(&ctx, &args),
-        Command::Fog(_) => fog::run(&ctx),
+        Command::Fog(args) => fog::run(&ctx, &args),
         Command::Guard(_) => guard::run(&ctx),
         Command::Doctor(args) => doctor::run(&ctx, &args),
         Command::Gc => gc::run(&ctx),
