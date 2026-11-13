@@ -97,6 +97,9 @@ pub enum Command {
     /// Promote an overlay file into tracked content.
     Promote(PromoteArgs),
 
+    /// Move a branch or worktree override up to the shared layer.
+    Share(ShareArgs),
+
     /// Print or write resolved environment variables.
     Env(EnvArgs),
 
@@ -113,10 +116,14 @@ pub enum Command {
     Doctor(DoctorArgs),
 
     /// Remove unused store data.
-    Gc,
+    Gc(GcArgs),
 
     /// Print version information.
     Version,
+
+    /// Print shell completion scripts.
+    #[command(hide = true)]
+    Completions(CompletionsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -212,6 +219,13 @@ pub struct PromoteArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ShareArgs {
+    /// Repository-relative path whose override should become shared.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Args)]
 #[allow(dead_code)] // Consumed by Phase 1+ implementations.
 pub struct EnvArgs {
     /// Output format.
@@ -272,16 +286,36 @@ pub struct GuardArgs {
 }
 
 #[derive(Debug, Subcommand)]
-#[allow(dead_code)] // Consumed by Phase 1+ implementations.
 pub enum GuardCommand {
     /// Install the guard hooks.
-    Install,
+    Install(GuardInstallArgs),
 
     /// Remove the guard hooks.
     Uninstall,
 
     /// Show guard status.
     Status,
+}
+
+#[derive(Debug, Args)]
+pub struct GuardInstallArgs {
+    /// Also install the opt-in post-checkout hook that runs `breeze sync`.
+    #[arg(long)]
+    pub with_post_checkout: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    /// Delete unused store files and prune old backups.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum, value_name = "SHELL")]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]

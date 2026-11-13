@@ -87,7 +87,11 @@ impl Repo {
     /// Discover the repository and require an initialized store (exit 4).
     pub fn open(ctx: &Ctx) -> Result<Self> {
         let info = GitInfo::discover(ctx.repo.as_deref())?;
-        let repo_id = identity::repo_id(info.remote.as_deref(), &info.root, &info.common_dir);
+        let repo_id = identity::repo_id(
+            info.remote.as_deref(),
+            &info.main_worktree,
+            &info.common_dir,
+        );
         let branch_id = info.branch.as_deref().map(identity::branch_id);
         let worktree_id = identity::worktree_id(&info.root);
         let store = Store::discover()?;
@@ -677,14 +681,32 @@ pub mod testutil {
         }
 
         pub fn breeze(&self, args: &[&str]) -> Output {
+            self.breeze_in(&self.main, args)
+        }
+
+        pub fn breeze_in(&self, dir: &Path, args: &[&str]) -> Output {
             Command::new(breeze_bin())
                 .arg("--repo")
-                .arg(&self.main)
+                .arg(dir)
                 .args(args)
                 .env("XDG_DATA_HOME", &self.data)
+                .env("XDG_CACHE_HOME", self.base.join("cache"))
                 .stdin(Stdio::null())
                 .output()
                 .expect("run breeze")
+        }
+
+        pub fn breeze_ok_in(&self, dir: &Path, args: &[&str]) -> String {
+            let output = self.breeze_in(dir, args);
+            assert!(
+                output.status.success(),
+                "breeze {:?} exited {:?}\nstdout: {}\nstderr: {}",
+                args,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
         }
 
         pub fn breeze_ok(&self, args: &[&str]) -> String {
@@ -732,7 +754,11 @@ pub mod testutil {
 
         pub fn store_dir(&self) -> PathBuf {
             let info = GitInfo::discover(Some(&self.main)).expect("discover repo");
-            let repo_id = identity::repo_id(info.remote.as_deref(), &info.root, &info.common_dir);
+            let repo_id = identity::repo_id(
+                info.remote.as_deref(),
+                &info.main_worktree,
+                &info.common_dir,
+            );
             self.data.join("breeze").join("repos").join(repo_id)
         }
 

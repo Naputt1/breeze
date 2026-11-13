@@ -26,7 +26,11 @@ const OVERLAY_NAME: &str = "fog.local.json";
 
 pub fn run(ctx: &Ctx, args: &FogArgs) -> Result<i32> {
     let info = GitInfo::discover(ctx.repo.as_deref())?;
-    let repo_id = identity::repo_id(info.remote.as_deref(), &info.root, &info.common_dir);
+    let repo_id = identity::repo_id(
+        info.remote.as_deref(),
+        &info.main_worktree,
+        &info.common_dir,
+    );
     let branch_id = info.branch.as_deref().map(identity::branch_id);
     let worktree_id = identity::worktree_id(&info.root);
     let store = store::Store::discover()?;

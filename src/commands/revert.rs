@@ -179,7 +179,6 @@ fn write_base(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use crate::store::overlay::testutil::TempRepo;
 

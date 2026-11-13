@@ -1,5 +1,6 @@
 //! Command dispatch.
 
+pub mod completions;
 pub mod diff;
 pub mod doctor;
 pub mod edit;
@@ -12,6 +13,7 @@ pub mod link;
 pub mod promote;
 pub mod revert;
 pub mod run;
+pub mod share;
 pub mod status;
 pub mod sync;
 pub mod unlink;
@@ -46,20 +48,17 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Diff(args) => diff::run(&ctx, &args),
         Command::Revert(args) => revert::run(&ctx, &args),
         Command::Promote(args) => promote::run(&ctx, &args),
+        Command::Share(args) => share::run(&ctx, &args),
         Command::Env(args) => env::run(&ctx, &args),
         Command::Run(args) => run::run(&ctx, &args),
         Command::Fog(args) => fog::run(&ctx, &args),
         Command::Guard(args) => guard::run(&ctx, &args),
         Command::Doctor(args) => doctor::run(&ctx, &args),
-        Command::Gc => gc::run(&ctx),
+        Command::Gc(args) => gc::run(&ctx, &args),
         Command::Version => {
             println!("breeze {}", env!("CARGO_PKG_VERSION"));
             Ok(exit::SUCCESS)
         }
+        Command::Completions(args) => completions::run(&args),
     }
-}
-
-/// Phase 0 placeholder for commands implemented in later phases.
-pub fn not_implemented() -> anyhow::Result<i32> {
-    Err(exit::CommandError::new(exit::USAGE, "not implemented yet").into())
 }

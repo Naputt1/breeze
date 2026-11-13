@@ -42,11 +42,12 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
     hash
 }
 
-/// Repository identity: a name plus a hash of the canonical common dir.
-pub fn repo_id(remote: Option<&str>, root: &Path, common_dir: &Path) -> String {
+/// Repository identity: the remote or main-worktree name plus a hash of the
+/// canonical common dir, so every worktree resolves to the same store.
+pub fn repo_id(remote: Option<&str>, main_worktree: &Path, common_dir: &Path) -> String {
     let base = remote
         .and_then(remote_basename)
-        .or_else(|| file_name(root))
+        .or_else(|| file_name(main_worktree))
         .unwrap_or_else(|| "repo".to_string());
     let name = non_empty(sanitize(&base), "repo");
     format!("{name}-{}", short_hash(&canonical_string(common_dir)))

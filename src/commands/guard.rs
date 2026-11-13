@@ -6,25 +6,27 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::cli::{GuardArgs, GuardCommand};
+use crate::cli::{GuardArgs, GuardCommand, GuardInstallArgs};
 use crate::commands::Ctx;
 use crate::exit::{self, CommandError};
 use crate::store::now_rfc3339;
 use crate::store::overlay::Repo;
 
 const HOOKS: [&str; 2] = ["pre-commit", "pre-push"];
+const POST_CHECKOUT: &str = "post-checkout";
+const MANAGED_HOOKS: [&str; 3] = ["pre-commit", "pre-push", POST_CHECKOUT];
 const MARKER: &str = "# breeze-managed (installed ";
 
 pub fn run(ctx: &Ctx, args: &GuardArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
-    match args.command {
-        GuardCommand::Install => install(&repo, ctx),
+    match &args.command {
+        GuardCommand::Install(install_args) => install(&repo, ctx, install_args),
         GuardCommand::Uninstall => uninstall(&repo, ctx),
         GuardCommand::Status => status(&repo, ctx),
     }
 }
 
-fn install(repo: &Repo, ctx: &Ctx) -> Result<i32> {
+fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
     if let Some(custom) = configured_hooks_path(repo)? {
         return Err(CommandError::new(
             exit::UNSAFE_REFUSED,
@@ -40,9 +42,18 @@ fn install(repo: &Repo, ctx: &Ctx) -> Result<i32> {
     create_hooks_dir(&hooks_dir)?;
     let installed = now_rfc3339();
     let overrides = repo.layout.overrides_file.display().to_string();
+    let binary = std::env::current_exe()
+        .context("failed to resolve the absolute path of the breeze binary")?
+        .display()
+        .to_string();
+
+    let mut names: Vec<&str> = HOOKS.to_vec();
+    if args.with_post_checkout {
+        names.push(POST_CHECKOUT);
+    }
 
     let mut report = Vec::new();
-    for name in HOOKS {
+    for name in names {
         let path = hooks_dir.join(name);
         let backup = backup_path(&hooks_dir, name);
 
@@ -66,7 +77,8 @@ fn install(repo: &Repo, ctx: &Ctx) -> Result<i32> {
 
         let script = match name {
             "pre-commit" => pre_commit_script(&overrides, &installed),
-            _ => pre_push_script(&overrides, &installed),
+            "pre-push" => pre_push_script(&overrides, &installed),
+            _ => post_checkout_script(&binary, &repo.info.root.display().to_string(), &installed),
         };
         write_hook(&path, &script)?;
         report.push(format!("installed {}", path.display()));
@@ -85,7 +97,7 @@ fn install(repo: &Repo, ctx: &Ctx) -> Result<i32> {
 fn uninstall(repo: &Repo, ctx: &Ctx) -> Result<i32> {
     let hooks_dir = repo.info.common_dir.join("hooks");
 
-    for name in HOOKS {
+    for name in MANAGED_HOOKS {
         let path = hooks_dir.join(name);
         let backup = backup_path(&hooks_dir, name);
 
@@ -132,7 +144,7 @@ fn status(repo: &Repo, ctx: &Ctx) -> Result<i32> {
         println!("core.hooksPath: {custom} (Breeze cannot manage hooks here)");
     }
 
-    for name in HOOKS {
+    for name in MANAGED_HOOKS {
         let path = hooks_dir.join(name);
         let backup = backup_path(&hooks_dir, name);
         let installed = fs::read_to_string(&path)
@@ -143,7 +155,14 @@ fn status(repo: &Repo, ctx: &Ctx) -> Result<i32> {
         } else {
             "not installed"
         };
-        println!("{name}: {state} ({})", path.display());
+        if name == POST_CHECKOUT && !installed {
+            println!(
+                "{name}: {state} (opt-in: `breeze guard install --with-post-checkout`) ({})",
+                path.display()
+            );
+        } else {
+            println!("{name}: {state} ({})", path.display());
+        }
         if backup.is_file() {
             println!("  backup: {}", backup.display());
         }
@@ -338,6 +357,32 @@ exit 0
         .replace("__OVERRIDDEN__", overridden_function())
 }
 
+fn post_checkout_script(binary: &str, root: &str, installed: &str) -> String {
+    let template = r#"#!/bin/sh
+# breeze-managed (installed __INSTALLED__)
+# Opt-in post-checkout hook: hydrate overlays after a checkout or a new worktree.
+# Breeze must never fail the checkout, so every step is best effort.
+BREEZE=__BINARY__
+REPO=__REPO__
+
+if [ -x "$BREEZE" ]; then
+  "$BREEZE" --repo "$REPO" sync --all --quiet >/dev/null 2>&1 || true
+fi
+
+backup="$(dirname "$0")/post-checkout.breeze-backup"
+if [ -x "$backup" ]; then
+  "$backup" "$@" || true
+fi
+
+exit 0
+"#;
+
+    template
+        .replace("__INSTALLED__", installed)
+        .replace("__BINARY__", &shell_quote(binary))
+        .replace("__REPO__", &shell_quote(root))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -462,5 +507,45 @@ mod tests {
         let (code, stderr) = repo.breeze_err(&["guard", "install"]);
         assert_eq!(code, 5);
         assert!(stderr.contains("core.hooksPath"), "{stderr}");
+    }
+
+    #[test]
+    fn post_checkout_is_opt_in_chains_and_never_fails_the_checkout() {
+        let repo = TempRepo::new("guard-post-checkout");
+        let hooks = repo.main.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let custom = hooks.join("post-checkout");
+        let marker = repo.base.join("post-checkout-chained.marker");
+        let original = format!("#!/bin/sh\necho chained > '{}'\n", marker.display());
+        fs::write(&custom, &original).unwrap();
+        fs::set_permissions(&custom, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(status.contains("post-checkout: not installed"), "{status}");
+
+        repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
+        let contents = fs::read_to_string(&custom).unwrap();
+        assert!(contents.contains("breeze-managed"), "{contents}");
+        assert!(contents.contains("sync --all"), "{contents}");
+        assert!(contents.contains("|| true"), "{contents}");
+        assert!(hooks.join("post-checkout.breeze-backup").is_file());
+
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(status.contains("post-checkout: installed"), "{status}");
+
+        // The hook exits 0 even when sync cannot do useful work, and chains.
+        let output = Command::new(&custom)
+            .args(["old", "new", "1"])
+            .current_dir(&repo.main)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(marker.is_file(), "the pre-existing hook was not chained");
+
+        repo.breeze_ok(&["guard", "uninstall"]);
+        assert_eq!(fs::read_to_string(&custom).unwrap(), original);
+        assert!(!hooks.join("post-checkout.breeze-backup").exists());
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(status.contains("post-checkout: not installed"), "{status}");
     }
 }
