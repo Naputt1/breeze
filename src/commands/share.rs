@@ -114,7 +114,7 @@ pub fn run(ctx: &Ctx, args: &ShareArgs) -> Result<i32> {
 /// Move the backing store file to `shared/files/`.
 fn share_link(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<String> {
     let old_file = repo.layout.repo_dir.join(&entry.source);
-    if !old_file.is_file() {
+    if !Repo::is_regular_store_file(&old_file) {
         return Err(CommandError::new(
             exit::GENERAL,
             format!(
@@ -129,10 +129,10 @@ fn share_link(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Stri
     let contents =
         fs::read(&old_file).with_context(|| format!("failed to read {}", old_file.display()))?;
 
-    if shared_file.exists() {
-        if !shared_file.is_file() {
+    if fs::symlink_metadata(&shared_file).is_ok() {
+        if !Repo::is_regular_store_file(&shared_file) {
             return Err(overlay::unsafe_refused(format!(
-                "shared store path {} exists but is not a file",
+                "shared store path {} exists but is not a regular file",
                 shared_file.display()
             )));
         }
@@ -240,7 +240,7 @@ fn repair_links(
 /// Move the stored patch and metadata to `shared/patches/`.
 fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<String> {
     let old_patch = repo.layout.repo_dir.join(&entry.source);
-    if !old_patch.is_file() {
+    if !Repo::is_regular_store_file(&old_patch) {
         return Err(CommandError::new(
             exit::GENERAL,
             format!(
@@ -251,6 +251,12 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
         .into());
     }
     let old_meta = patches::metadata_path_for(&old_patch)?;
+    if !Repo::is_regular_store_file(&old_meta) {
+        return Err(overlay::unsafe_refused(format!(
+            "patch metadata for `{relative}` is missing or is not a regular file ({})",
+            old_meta.display()
+        )));
+    }
     let patch_bytes =
         fs::read(&old_patch).with_context(|| format!("failed to read {}", old_patch.display()))?;
     let meta_bytes = fs::read(&old_meta).with_context(|| {
@@ -263,10 +269,10 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
     let patch_files = patches::patch_files(&repo.layout.shared_dir, relative);
     let shared_patch = patch_files.patch;
     let shared_meta = patch_files.metadata;
-    if shared_patch.exists() {
-        if !shared_patch.is_file() {
+    if fs::symlink_metadata(&shared_patch).is_ok() {
+        if !Repo::is_regular_store_file(&shared_patch) {
             return Err(overlay::unsafe_refused(format!(
-                "shared patch path {} exists but is not a file",
+                "shared patch path {} exists but is not a regular file",
                 shared_patch.display()
             )));
         }
@@ -285,7 +291,7 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
     repo.write_store_file(&shared_meta, &meta_bytes)?;
     fs::remove_file(&old_patch)
         .with_context(|| format!("failed to remove {}", old_patch.display()))?;
-    if old_meta.is_file() {
+    if overlay::exists(&old_meta) {
         fs::remove_file(&old_meta)
             .with_context(|| format!("failed to remove {}", old_meta.display()))?;
     }

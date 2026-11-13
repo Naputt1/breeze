@@ -63,8 +63,11 @@ pub fn run(ctx: &Ctx, args: &DiffArgs) -> Result<i32> {
 
 fn show_patch(repo: &Repo, path: &str, entry: &OverrideEntry, stat: bool) -> Result<()> {
     let patch_file = repo.layout.repo_dir.join(&entry.source);
-    if !patch_file.is_file() {
-        println!("MISSING {path} patch file: {}", patch_file.display());
+    if !Repo::is_regular_store_file(&patch_file) {
+        println!(
+            "MISSING {path} patch file (or it is not a regular file): {}",
+            patch_file.display()
+        );
         return Ok(());
     }
 

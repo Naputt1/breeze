@@ -172,6 +172,14 @@ impl Repo {
         overrides.save(&self.layout.overrides_file)
     }
 
+    /// True only for a regular store file. A symlink is never accepted: overlay
+    /// reads must not follow links that could point outside the store.
+    pub fn is_regular_store_file(path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+    }
+
     /// Write a store copy with private permissions, creating parents.
     pub fn write_store_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -340,14 +348,20 @@ fn source_worktree_id(source: &str) -> Option<&str> {
 }
 
 /// Join user input against the worktree root, rejecting `..` components.
+/// True when any component of `path` is `..`.
+///
+/// Callers reject these before joining the path into a worktree: a `..` could
+/// climb out of the repository, and canonicalization alone cannot undo that.
+pub(crate) fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
 fn join_input(repo: &Repo, input: &Path) -> Result<PathBuf> {
     if input.as_os_str().is_empty() {
         return Err(CommandError::new(exit::USAGE, "path must not be empty").into());
     }
-    if input
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    if has_parent_dir(input) {
         return Err(unsafe_refused(format!(
             "path `{}` contains `..`; pass a path inside the worktree",
             input.display()
@@ -685,15 +699,37 @@ pub mod testutil {
         }
 
         pub fn breeze_in(&self, dir: &Path, args: &[&str]) -> Output {
-            Command::new(breeze_bin())
+            self.breeze_in_env(dir, args, &[])
+        }
+
+        pub fn breeze_in_env(&self, dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+            let mut command = Command::new(breeze_bin());
+            command
                 .arg("--repo")
                 .arg(dir)
                 .args(args)
                 .env("XDG_DATA_HOME", &self.data)
                 .env("XDG_CACHE_HOME", self.base.join("cache"))
-                .stdin(Stdio::null())
-                .output()
-                .expect("run breeze")
+                // Tests never inherit a developer editor; `$EDITOR` tests opt in.
+                .env_remove("EDITOR")
+                .stdin(Stdio::null());
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            command.output().expect("run breeze")
+        }
+
+        pub fn breeze_ok_in_env(&self, dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
+            let output = self.breeze_in_env(dir, args, envs);
+            assert!(
+                output.status.success(),
+                "breeze {:?} exited {:?}\nstdout: {}\nstderr: {}",
+                args,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
         }
 
         pub fn breeze_ok_in(&self, dir: &Path, args: &[&str]) -> String {
@@ -836,5 +872,52 @@ mod tests {
         };
         assert_eq!(source_branch_id(&entry.source), Some("feature-1234"));
         assert_eq!(source_worktree_id(&entry.source), None);
+    }
+
+    use proptest::prelude::*;
+
+    fn path_segments() -> impl Strategy<Value = Vec<String>> {
+        prop::collection::vec(
+            prop_oneof![
+                Just("..".to_string()),
+                "[a-z]{1,6}".prop_map(|segment: String| segment),
+            ],
+            1..6,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn parent_components_are_detected_in_any_position(segments in path_segments()) {
+            let path = segments.join("/");
+            let contains_parent = segments.iter().any(|segment| segment == "..");
+            prop_assert_eq!(has_parent_dir(Path::new(&path)), contains_parent);
+        }
+
+        #[test]
+        fn plain_relative_paths_have_no_parent_component(
+            segments in prop::collection::vec("[a-z][a-z0-9]{0,6}", 1..6),
+        ) {
+            prop_assert!(!has_parent_dir(Path::new(&segments.join("/"))));
+        }
+    }
+
+    #[test]
+    fn parent_components_are_detected_in_table_variants() {
+        for path in [
+            "..",
+            "../x",
+            "a/../x",
+            "a/../../x",
+            "./../x",
+            "deep/nested/../../../escape",
+        ] {
+            assert!(has_parent_dir(Path::new(path)), "{path}");
+        }
+        for path in ["a/b", "./a", "a/./b", ".hidden"] {
+            assert!(!has_parent_dir(Path::new(path)), "{path}");
+        }
     }
 }

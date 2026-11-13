@@ -50,11 +50,11 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
 
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                if !store.is_file() {
+                if !Repo::is_regular_store_file(&store) {
                     return Err(CommandError::new(
                         exit::GENERAL,
                         format!(
-                            "store copy is missing for `{relative}` ({}); cannot restore it",
+                            "store copy is missing or unsafe for `{relative}` ({}); cannot restore it",
                             store.display()
                         ),
                     )
@@ -67,7 +67,7 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
                 });
             }
             Ok(metadata) if metadata.is_file() => {
-                if !store.is_file() {
+                if !Repo::is_regular_store_file(&store) {
                     continue;
                 }
                 let current = fs::read(&path)
@@ -100,7 +100,7 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
                 )));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                if target.current && store.is_file() {
+                if target.current && Repo::is_regular_store_file(&store) {
                     plan.push(Restore {
                         target: path,
                         store,
@@ -140,7 +140,7 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
 
     for entry in &entries {
         let store = repo.layout.repo_dir.join(&entry.source);
-        if store.is_file() {
+        if Repo::is_regular_store_file(&store) {
             fs::remove_file(&store)
                 .with_context(|| format!("failed to remove {}", store.display()))?;
             repo.prune_empty_parents(&store);

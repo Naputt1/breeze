@@ -46,9 +46,9 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
             let store_file = repo.layout.repo_dir.join(&entry.source);
             let link = target.path.join(path);
 
-            if !store_file.is_file() {
+            if !Repo::is_regular_store_file(&store_file) {
                 println!(
-                    "BROKEN {path} store copy is missing: {}",
+                    "BROKEN {path} store copy is missing or is not a regular file: {}",
                     store_file.display()
                 );
                 problems += 1;
@@ -212,9 +212,9 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
             continue;
         };
         let patch_file = repo.layout.repo_dir.join(&entry.source);
-        if !patch_file.is_file() {
+        if !Repo::is_regular_store_file(&patch_file) {
             println!(
-                "BROKEN {path} patch file is missing: {}",
+                "BROKEN {path} patch file is missing or is not a regular file: {}",
                 patch_file.display()
             );
             problems += 1;

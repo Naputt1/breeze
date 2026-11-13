@@ -80,9 +80,9 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
             let store_file = repo.layout.repo_dir.join(&entry.source);
             let link = target.path.join(path);
 
-            if !store_file.is_file() {
+            if !Repo::is_regular_store_file(&store_file) {
                 eprintln!(
-                    "error: store copy for `{path}` is missing ({})",
+                    "error: store copy for `{path}` is missing or is not a regular file ({})",
                     store_file.display()
                 );
                 failures += 1;
@@ -183,8 +183,11 @@ fn sync_patch(
     };
 
     let patch_file = repo.layout.repo_dir.join(&entry.source);
-    if !patch_file.is_file() {
-        anyhow::bail!("store patch is missing ({})", patch_file.display());
+    if !Repo::is_regular_store_file(&patch_file) {
+        anyhow::bail!(
+            "store patch is missing or is not a regular file ({})",
+            patch_file.display()
+        );
     }
     let meta_file = patches::metadata_path_for(&patch_file)?;
     let metadata = patches::read_metadata(&meta_file)?;

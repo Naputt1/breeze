@@ -144,10 +144,7 @@ pub fn current_branch(root: &Path) -> Result<Option<String>> {
 
     // An unborn branch (fresh `git init`, no commits) has no HEAD commit yet,
     // but its name is still available from the symbolic ref.
-    Ok(git_stdout(
-        root,
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )?)
+    git_stdout(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
 }
 
 /// The `origin` remote URL, when one is configured.

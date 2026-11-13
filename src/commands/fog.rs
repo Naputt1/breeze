@@ -494,7 +494,7 @@ mod tests {
             &repo,
             "demo-12345678",
             "main-abcdef12",
-            &[overlay.clone()],
+            std::slice::from_ref(&overlay),
             &temp.path().join("cache"),
             true,
         )
@@ -531,7 +531,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )
@@ -547,7 +547,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )
@@ -564,7 +564,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )
@@ -581,7 +581,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )
@@ -613,7 +613,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )
@@ -662,7 +662,7 @@ mod tests {
             &fixture.repo,
             "demo-12345678",
             "main-abcdef12",
-            &[fixture.shared.clone()],
+            std::slice::from_ref(&fixture.shared),
             &fixture.cache(),
             true,
         )

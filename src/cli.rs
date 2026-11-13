@@ -237,17 +237,21 @@ pub struct EnvArgs {
     )]
     pub format: EnvFormat,
 
-    /// Write the resolved environment to the overlay env file.
+    /// Write the resolved environment to `.env.local` in the current worktree.
     #[arg(long)]
     pub write: bool,
 
-    /// Show values without masking secrets.
+    /// Print the environment (accepted for compatibility; values stay masked).
     #[arg(long)]
     pub show: bool,
 
     /// Reveal secret values.
     #[arg(long)]
     pub reveal: bool,
+
+    /// Overwrite an existing `.env.local`, backing it up first.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

@@ -239,4 +239,43 @@ mod tests {
         let missing = Path::new("/definitely/not/a/breeze/exclude");
         assert_eq!(read(missing).unwrap(), "");
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The managed block behaves as a set: every inserted path appears
+        /// exactly once, insertion is idempotent, and text outside survives.
+        #[test]
+        fn managed_block_tracks_a_set_without_touching_outside_text(
+            outside in prop::option::of("[a-z0-9][a-z0-9 ._/]{0,19}"),
+            paths in prop::collection::vec(
+                "[a-zA-Z0-9][a-zA-Z0-9_./-]{0,19}",
+                1..8,
+            ),
+        ) {
+            let prefix = outside.map(|line| format!("{line}\n")).unwrap_or_default();
+            let mut text = prefix.clone();
+            for path in &paths {
+                text = upsert(&text, path);
+            }
+
+            let managed: HashSet<String> = managed_paths(&text).into_iter().collect();
+            let expected: HashSet<String> = paths.iter().cloned().collect();
+            prop_assert_eq!(managed, expected);
+
+            let stable = text.clone();
+            for path in &paths {
+                text = upsert(&text, path);
+            }
+            prop_assert_eq!(&text, &stable);
+            prop_assert!(text.starts_with(&prefix));
+
+            if let Some(path) = paths.first() {
+                let removed = remove(&text, path);
+                prop_assert!(!managed_paths(&removed).contains(path));
+            }
+        }
+    }
 }

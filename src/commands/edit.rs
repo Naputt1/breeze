@@ -1,7 +1,6 @@
 //! `breeze edit` — edit a tracked file and store the change as a patch.
 
 use std::fs;
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
@@ -130,7 +129,10 @@ fn require_editable(repo: &Repo, relative: &str, worktree_path: &Path) -> Result
     Ok(())
 }
 
-/// `--editor`, then `$EDITOR` (only with a terminal), then `vi`.
+/// `--editor`, then `$EDITOR`.
+///
+/// `$EDITOR` is spawned exactly as given, so non-interactive editors such as
+/// `sed -i` work without a terminal. Only the absence of both is refused.
 fn resolve_editor(args: &EditArgs) -> Result<Vec<String>> {
     if let Some(command) = &args.editor {
         let parts = split_command(command);
@@ -138,14 +140,6 @@ fn resolve_editor(args: &EditArgs) -> Result<Vec<String>> {
             return Err(CommandError::new(exit::USAGE, "`--editor` must not be empty").into());
         }
         return Ok(parts);
-    }
-
-    if !std::io::stdin().is_terminal() {
-        return Err(CommandError::new(
-            exit::UNSAFE_REFUSED,
-            "no terminal is attached; pass `--editor CMD` or set an editor that works without a TTY",
-        )
-        .into());
     }
 
     match std::env::var("EDITOR") {
@@ -156,7 +150,11 @@ fn resolve_editor(args: &EditArgs) -> Result<Vec<String>> {
             }
             Ok(parts)
         }
-        _ => Ok(vec!["vi".to_string()]),
+        _ => Err(CommandError::new(
+            exit::UNSAFE_REFUSED,
+            "no editor configured; pass `--editor CMD` or set $EDITOR",
+        )
+        .into()),
     }
 }
 
@@ -342,6 +340,27 @@ pub(crate) mod tests {
         let (code, stderr) = repo.breeze_err(&["edit", "blob.bin", "--editor", &editor]);
         assert_eq!(code, 5);
         assert!(stderr.contains("binary"), "{stderr}");
+    }
+
+    #[test]
+    fn edit_uses_editor_env_without_a_tty_and_refuses_without_an_editor() {
+        let repo = TempRepo::new("edit-editor-env");
+        commit_file(&repo, "fog.json", "base\n");
+
+        let editor = write_editor(&repo, "env-editor", "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok_in_env(&repo.main, &["edit", "fog.json"], &[("EDITOR", &editor)]);
+        let patch = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main))
+            .join("patches/fog.json.patch");
+        assert!(patch.is_file(), "missing {}", patch.display());
+        assert!(fs::read_to_string(&patch).unwrap().contains("local"));
+
+        // No `--editor` and no `$EDITOR` is the only refused case.
+        let (code, stderr) = repo.breeze_err(&["edit", "fog.json"]);
+        assert_eq!(code, 5, "{stderr}");
+        assert!(stderr.contains("$EDITOR"), "{stderr}");
     }
 
     #[test]

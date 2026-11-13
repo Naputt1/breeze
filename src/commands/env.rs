@@ -39,7 +39,7 @@ pub fn run(ctx: &Ctx, args: &EnvArgs) -> Result<i32> {
     };
 
     if args.write {
-        write_env_local(&repo, &merged, ctx)?;
+        write_env_local(&repo, &merged, args.force, ctx)?;
     }
 
     if !ctx.quiet {
@@ -71,21 +71,29 @@ fn confirm_reveal() -> Result<()> {
     Ok(())
 }
 
-fn write_env_local(repo: &Repo, merged: &BTreeMap<String, String>, ctx: &Ctx) -> Result<()> {
+fn write_env_local(
+    repo: &Repo,
+    merged: &BTreeMap<String, String>,
+    force: bool,
+    ctx: &Ctx,
+) -> Result<()> {
     let path = repo.info.root.join(".env.local");
 
-    // `EnvArgs` exposes no `--force`; refuse rather than silently replacing a
-    // file the user may have edited. (See the phase report for this deviation.)
-    if overlay::exists(&path) {
-        return Err(CommandError::new(
-            exit::UNSAFE_REFUSED,
-            format!(
-                "{} already exists; remove it before writing the merged environment",
-                path.display()
-            ),
-        )
-        .into());
-    }
+    let backup = if overlay::exists(&path) {
+        if !force {
+            return Err(CommandError::new(
+                exit::UNSAFE_REFUSED,
+                format!(
+                    "{} already exists; rerun with `--force` to back it up and overwrite it",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        Some(repo.backup_file(&path)?)
+    } else {
+        None
+    };
 
     let contents = envfile::format_dotenv(merged);
     envfile::write_atomic(&path, &contents)?;
@@ -94,6 +102,9 @@ fn write_env_local(repo: &Repo, merged: &BTreeMap<String, String>, ctx: &Ctx) ->
 
     if !ctx.quiet {
         eprintln!("wrote {} ({}) variables", path.display(), merged.len());
+        if let Some(backup) = backup {
+            eprintln!("backup: {}", backup.display());
+        }
     }
     Ok(())
 }
@@ -144,6 +155,52 @@ mod tests {
     }
 
     #[test]
+    fn env_write_force_backs_up_and_replaces_an_existing_file() {
+        let repo = TempRepo::new("env-force");
+        write_layers(&repo);
+        repo.breeze_ok(&["env", "--write"]);
+
+        let path = repo.main.join(".env.local");
+        fs::write(&path, "LOCAL=keep\n").unwrap();
+
+        let (code, stderr) = repo.breeze_err(&["env", "--write"]);
+        assert_eq!(code, 5);
+        assert!(stderr.contains("--force"), "{stderr}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "LOCAL=keep\n");
+
+        repo.breeze_ok(&["env", "--write", "--force"]);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("A=shared"), "{contents}");
+        assert!(!contents.contains("LOCAL=keep"), "{contents}");
+
+        let backups = repo.store_dir().join("backups");
+        let mut backup = None;
+        for entry in fs::read_dir(&backups).unwrap() {
+            let dir = entry.unwrap().path();
+            for file in fs::read_dir(&dir).unwrap() {
+                let file = file.unwrap().path();
+                if file.file_name().and_then(|name| name.to_str()) == Some(".env.local") {
+                    backup = Some((dir.clone(), file));
+                }
+            }
+        }
+        let (dir, backup) = backup.expect("expected a backup of the previous .env.local");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "LOCAL=keep\n");
+
+        if cfg!(unix) {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
     fn env_merges_shared_then_branch_then_worktree() {
         let repo = TempRepo::new("env-merge");
         write_layers(&repo);
@@ -167,10 +224,7 @@ mod tests {
         // A second write refuses rather than clobbering the file.
         let (code, _) = repo.breeze_err(&["env", "--write"]);
         assert_eq!(code, 5);
-        assert_eq!(
-            fs::read_to_string(&path).unwrap().contains("A=shared"),
-            true
-        );
+        assert!(fs::read_to_string(&path).unwrap().contains("A=shared"));
     }
 
     #[test]

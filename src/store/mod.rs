@@ -185,12 +185,30 @@ impl RepoLayout {
 
 /// Create (or tighten) a directory to mode 0700.
 pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
-    if path.exists() && !path.is_dir() {
-        bail!("{} exists but is not a directory", path.display());
-    }
-    if !path.exists() {
-        fs::create_dir_all(path)
-            .with_context(|| format!("failed to create directory {}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(crate::exit::CommandError::new(
+                    crate::exit::UNSAFE_REFUSED,
+                    format!(
+                        "refusing to use symlinked directory {} (it may escape the store)",
+                        path.display()
+                    ),
+                )
+                .into());
+            }
+            if !metadata.is_dir() {
+                bail!("{} exists but is not a directory", path.display());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("failed to create directory {}", path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect directory {}", path.display()));
+        }
     }
     set_mode(path, DIR_MODE)
 }
@@ -199,6 +217,21 @@ pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
+    }
+
+    // Never write through a link: a store file swapped for a symlink must not
+    // redirect writes outside the store.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(crate::exit::CommandError::new(
+                crate::exit::UNSAFE_REFUSED,
+                format!(
+                    "refusing to write through symlink {} (it may escape the store)",
+                    path.display()
+                ),
+            )
+            .into());
+        }
     }
 
     let mut options = fs::OpenOptions::new();
@@ -319,7 +352,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            return fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+            fs::metadata(path).expect("metadata").permissions().mode() & 0o777
         }
         #[cfg(not(unix))]
         {

@@ -42,6 +42,11 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
     for entry in &patch_entries {
         let patch_file = repo.layout.repo_dir.join(&entry.source);
         let meta_file = patches::metadata_path_for(&patch_file)?;
+        if !Repo::is_regular_store_file(&patch_file) || !Repo::is_regular_store_file(&meta_file) {
+            return Err(overlay::unsafe_refused(format!(
+                "patch files for `{relative}` are missing or are not regular files; run `breeze doctor`"
+            )));
+        }
         let metadata = patches::read_metadata(&meta_file).with_context(|| {
             format!(
                 "failed to read patch metadata for `{relative}` ({})",

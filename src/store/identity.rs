@@ -168,4 +168,46 @@ mod tests {
         assert_eq!(worktree.len(), "my-tree-".len() + 8);
         assert_eq!(worktree, worktree_id(Path::new("/work/trees/My Tree")));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Sanitized names contain only `[a-z0-9-]`, never start or end with a
+        /// dash, and never become `.` or `..`.
+        #[test]
+        fn sanitize_emits_only_safe_component_characters(input in ".*") {
+            let sanitized = sanitize(&input);
+            prop_assert!(sanitized
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+            prop_assert!(!sanitized.starts_with('-'));
+            prop_assert!(!sanitized.ends_with('-'));
+            prop_assert!(sanitized != ".");
+            prop_assert!(sanitized != "..");
+
+            if let Some(first) = sanitized.bytes().next() {
+                prop_assert!(first.is_ascii_alphanumeric());
+                prop_assert!(sanitized.bytes().last().unwrap().is_ascii_alphanumeric());
+            }
+
+            let named = non_empty(sanitize(&input), "fallback");
+            prop_assert!(!named.is_empty());
+            prop_assert!(named != ".");
+            prop_assert!(named != "..");
+        }
+
+        /// Generated ids are always safe single path components.
+        #[test]
+        fn generated_ids_are_single_safe_components(input in ".*") {
+            for id in [branch_id(&input), worktree_id(Path::new(&input))] {
+                prop_assert!(!id.is_empty());
+                prop_assert!(!id.contains('/'));
+                prop_assert!(!id.contains('\\'));
+                prop_assert!(!id.contains(".."));
+                prop_assert!(id.is_ascii());
+            }
+        }
+    }
 }

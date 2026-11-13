@@ -41,6 +41,7 @@ cd ~/code/my-app
 breeze init                      # create the store for this repository
 breeze link config/local.toml    # untracked file, shared by every worktree
 breeze env --write               # write merged overlay env values to .env.local
+breeze env --write --force       # back up an existing .env.local, then replace it
 breeze fog -- dev                # run fog with merged overlay configuration
 ```
 
@@ -79,7 +80,7 @@ Global flags accepted by every command:
 | `breeze revert <PATH> [--force]` | Remove overlay changes for a file and restore tracked content. |
 | `breeze promote <PATH>` | Turn a recorded patch into ordinary tracked content, ready to commit. |
 | `breeze share <PATH>` | Move a branch or worktree override up to the shared layer. |
-| `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree and never overwrites an existing file. |
+| `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
 | `breeze guard install [--with-post-checkout]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` additionally installs an opt-in hook that runs `breeze sync --all` after checkout and worktree creation. |
@@ -149,7 +150,11 @@ An `exclude` block in `.git/info/exclude` keeps overlay paths out of
 - Breeze never uploads or prints file contents; `env` masks values unless you
   explicitly reveal them on a terminal, and never logs environment values.
 - Operations that would overwrite something differing are refused with exit
-  `5`. `unlink --force` and `revert --force` make backups in the store first.
+  `5`. `env --write --force`, `unlink --force` and `revert --force` make backups
+  in the store first.
+- Store files are never read or written through symlinks, so a store copy
+  swapped for a link outside the store is reported as broken instead of
+  followed.
 - The guard hooks block commits and pushes that include overridden paths,
   unless `BREEZE_ALLOW_COMMIT=1` is set. They chain to pre-existing hooks.
 - The post-checkout hook is opt-in, runs `breeze sync --all` best-effort, and

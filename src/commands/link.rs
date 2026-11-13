@@ -31,18 +31,16 @@ pub fn run(ctx: &Ctx, args: &LinkArgs) -> Result<i32> {
     }
 
     let store_file = repo.store_file(layer, &relative)?;
-    if store_file.exists() && !store_file.is_file() {
-        return Err(CommandError::new(
-            exit::UNSAFE_REFUSED,
-            format!(
-                "store path {} exists but is not a file",
-                store_file.display()
-            ),
-        )
-        .into());
+    let store_exists = Repo::is_regular_store_file(&store_file);
+    if !store_exists {
+        if let Ok(metadata) = fs::symlink_metadata(&store_file) {
+            return Err(overlay::unsafe_refused(format!(
+                "store path {} exists but is not a regular file (found {:?})",
+                store_file.display(),
+                metadata.file_type()
+            )));
+        }
     }
-
-    let store_exists = store_file.is_file();
     let source_bytes = if store_exists {
         fs::read(&store_file).with_context(|| format!("failed to read {}", store_file.display()))?
     } else {
@@ -267,8 +265,17 @@ mod tests {
         let (code, _) = repo.breeze_err(&["link", "a-directory"]);
         assert_eq!(code, 5);
 
-        let (code, _) = repo.breeze_err(&["link", "../outside.txt"]);
-        assert_eq!(code, 5);
+        for path in [
+            "..",
+            "../outside.txt",
+            "a/../outside.txt",
+            "a/../../outside.txt",
+            "./../outside.txt",
+        ] {
+            let (code, stderr) = repo.breeze_err(&["link", path]);
+            assert_eq!(code, 5, "{path}: {stderr}");
+            assert!(stderr.contains(".."), "{path}: {stderr}");
+        }
 
         let (code, _) = repo.breeze_err(&["link", "does-not-exist.txt"]);
         assert_eq!(code, 2);

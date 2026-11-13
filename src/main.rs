@@ -6,6 +6,9 @@ mod fog;
 mod gitinfo;
 mod store;
 
+#[cfg(test)]
+mod hardening;
+
 use clap::Parser;
 
 fn main() {

@@ -308,14 +308,11 @@ fn remove_empty_dirs(repo: &Repo, report: &mut Vec<String>) -> Result<()> {
         let empty = fs::read_dir(&dir)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(false);
-        if empty {
-            match fs::remove_dir(&dir) {
-                Ok(()) => report.push(format!(
-                    "removed empty directory {}",
-                    overlay::relative_string(&repo.layout.repo_dir, &dir)
-                )),
-                Err(_) => {}
-            }
+        if empty && fs::remove_dir(&dir).is_ok() {
+            report.push(format!(
+                "removed empty directory {}",
+                overlay::relative_string(&repo.layout.repo_dir, &dir)
+            ));
         }
     }
     Ok(())

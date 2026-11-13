@@ -155,7 +155,7 @@ fn count_issues(repo: &Repo, links: &[&OverrideEntry]) -> Result<usize> {
                 continue;
             };
             let store_file = repo.layout.repo_dir.join(&entry.source);
-            if !store_file.is_file() {
+            if !Repo::is_regular_store_file(&store_file) {
                 issues += 1;
                 continue;
             }
