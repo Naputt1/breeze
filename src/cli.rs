@@ -306,7 +306,7 @@ pub enum GuardCommand {
 
     /// Internal pre-rebase check used by the installed hook.
     #[command(hide = true)]
-    CheckRebase(CheckRebaseArgs),
+    CheckRebase,
 }
 
 #[derive(Debug, Args)]
@@ -324,18 +324,6 @@ pub struct GuardInstallArgs {
     /// post-applypatch and pre-rebase.
     #[arg(long)]
     pub with_all_hooks: bool,
-
-    /// With --with-all-hooks, let the pre-rebase hook run `breeze revert --all`
-    /// (with backups) instead of blocking the rebase.
-    #[arg(long, requires = "with_all_hooks")]
-    pub rebase_auto_revert: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct CheckRebaseArgs {
-    /// Revert active patches instead of blocking the rebase.
-    #[arg(long)]
-    pub auto_revert: bool,
 }
 
 #[derive(Debug, Args)]

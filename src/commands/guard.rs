@@ -6,8 +6,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::cli::{CheckRebaseArgs, GuardArgs, GuardCommand, GuardInstallArgs};
-use crate::commands::{revert, Ctx};
+use crate::cli::{GuardArgs, GuardCommand, GuardInstallArgs};
+use crate::commands::Ctx;
 use crate::exit::{self, CommandError};
 use crate::store::now_rfc3339;
 use crate::store::overlay::{self, Repo};
@@ -36,7 +36,7 @@ pub fn run(ctx: &Ctx, args: &GuardArgs) -> Result<i32> {
         GuardCommand::Install(install_args) => install(&repo, ctx, install_args),
         GuardCommand::Uninstall => uninstall(&repo, ctx),
         GuardCommand::Status => status(&repo, ctx),
-        GuardCommand::CheckRebase(check_args) => check_rebase(&repo, ctx, check_args),
+        GuardCommand::CheckRebase => check_rebase(&repo),
     }
 }
 
@@ -60,7 +60,9 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
         .context("failed to resolve the absolute path of the breeze binary")?
         .display()
         .to_string();
-    let root = repo.info.root.display().to_string();
+    // Hooks live in the common Git directory, so they must point at the main
+    // worktree rather than the (possibly linked) worktree used to install.
+    let root = repo.info.main_worktree.display().to_string();
 
     let mut names: Vec<&str> = HOOKS.to_vec();
     if args.with_post_checkout || args.with_all_hooks {
@@ -105,7 +107,7 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
             POST_MERGE | POST_REWRITE | POST_APPLYPATCH => {
                 pull_hook_script(name, &binary, &root, &installed)
             }
-            PRE_REBASE => pre_rebase_script(&binary, args.rebase_auto_revert, &installed),
+            PRE_REBASE => pre_rebase_script(&binary, &installed),
             _ => unreachable!("unmanaged hook {name}"),
         };
         write_hook(&path, &script)?;
@@ -113,7 +115,7 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
     }
 
     if !ctx.quiet {
-        println!("guard installed for {}", repo.info.root.display());
+        println!("guard installed for {root}");
         for line in report {
             println!("  {line}");
         }
@@ -122,7 +124,7 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
     Ok(exit::SUCCESS)
 }
 
-fn check_rebase(repo: &Repo, ctx: &Ctx, args: &CheckRebaseArgs) -> Result<i32> {
+fn check_rebase(repo: &Repo) -> Result<i32> {
     let overrides = repo.overrides()?;
     let current = repo.current_target();
     let mut all_paths: Vec<String> = overrides
@@ -152,17 +154,6 @@ fn check_rebase(repo: &Repo, ctx: &Ctx, args: &CheckRebaseArgs) -> Result<i32> {
         return Ok(exit::SUCCESS);
     }
 
-    if args.auto_revert {
-        eprintln!(
-            "breeze: reverting {} tracked patch overlay(s) before the rebase; backups are kept",
-            active.len()
-        );
-        for path in &active {
-            revert::revert_relative(repo, ctx, path, true)?;
-        }
-        return Ok(exit::SUCCESS);
-    }
-
     eprintln!(
         "breeze: {} tracked patch overlay(s) are active; a rebase can discard or conflict with them",
         active.len()
@@ -174,9 +165,6 @@ fn check_rebase(repo: &Repo, ctx: &Ctx, args: &CheckRebaseArgs) -> Result<i32> {
         eprintln!("  ... and {} more", active.len() - 10);
     }
     eprintln!("run `breeze revert --all` and retry the rebase");
-    eprintln!(
-        "or reinstall with `breeze guard install --with-all-hooks --rebase-auto-revert` to revert automatically"
-    );
     Ok(exit::GUARD_BLOCKED)
 }
 
@@ -463,8 +451,14 @@ REPO=__REPO__
 if [ "$3" = "1" ]; then
   if [ ! -x "$BREEZE" ]; then
     printf 'breeze: warning: embedded binary not found at %s; run `breeze guard install` again.\n' "$BREEZE" >&2
-  elif "$BREEZE" --repo "$REPO" --quiet status >/dev/null 2>&1; then
-    if ! "$BREEZE" --repo "$REPO" --quiet sync --all; then
+  else
+    "$BREEZE" --repo "$REPO" --quiet status >/dev/null 2>&1
+    status=$?
+    if [ "$status" -eq 4 ]; then
+      :
+    elif [ "$status" -ne 0 ]; then
+      printf 'breeze: cannot read the Breeze store for %s (status exited %s); reinstall the hooks after moving the repository.\n' "$REPO" "$status" >&2
+    elif ! "$BREEZE" --repo "$REPO" --quiet sync --all; then
       printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
     fi
   fi
@@ -494,8 +488,14 @@ REPO=__REPO__
 
 if [ ! -x "$BREEZE" ]; then
   printf 'breeze: warning: embedded binary not found at %s; run `breeze guard install` again.\n' "$BREEZE" >&2
-elif "$BREEZE" --repo "$REPO" --quiet status >/dev/null 2>&1; then
-  if ! "$BREEZE" --repo "$REPO" --quiet sync --all; then
+else
+  "$BREEZE" --repo "$REPO" --quiet status >/dev/null 2>&1
+  status=$?
+  if [ "$status" -eq 4 ]; then
+    :
+  elif [ "$status" -ne 0 ]; then
+    printf 'breeze: cannot read the Breeze store for %s (status exited %s); reinstall the hooks after moving the repository.\n' "$REPO" "$status" >&2
+  elif ! "$BREEZE" --repo "$REPO" --quiet sync --all; then
     printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
   fi
 fi
@@ -515,18 +515,18 @@ exit 0
         .replace("__REPO__", &shell_quote(root))
 }
 
-fn pre_rebase_script(binary: &str, auto_revert: bool, installed: &str) -> String {
+fn pre_rebase_script(binary: &str, installed: &str) -> String {
     let template = r#"#!/bin/sh
 # breeze-managed (installed __INSTALLED__)
-# Opt-in pre-rebase hook: block a rebase while Breeze patches are active,
-# or revert them first when auto-revert was requested at install time.
+# Opt-in pre-rebase hook: block a rebase while Breeze patches are active.
+# This is best effort: Git rejects a dirty worktree before running the hook.
 # Breeze must never lose tracked patches silently.
 BREEZE=__BINARY__
 
 if [ ! -x "$BREEZE" ]; then
   printf 'breeze: warning: embedded binary not found at %s; run `breeze guard install` again.\n' "$BREEZE" >&2
 else
-  "$BREEZE" --repo "$(pwd)" --quiet guard check-rebase__AUTO_REVERT__
+  "$BREEZE" --repo "$(pwd)" --quiet guard check-rebase
   status=$?
   case "$status" in
     0|4) ;;
@@ -544,10 +544,6 @@ exit 0
 
     template
         .replace("__INSTALLED__", installed)
-        .replace(
-            "__AUTO_REVERT__",
-            if auto_revert { " --auto-revert" } else { "" },
-        )
         .replace("__BINARY__", &shell_quote(binary))
 }
 
@@ -990,6 +986,83 @@ mod tests {
     }
 
     #[test]
+    fn hooks_embed_the_main_worktree_and_survive_removing_the_installing_worktree() {
+        let repo = TempRepo::new("guard-main-worktree");
+        commit_file(&repo, "base.txt", "base\n");
+        make_link(&repo);
+        repo.breeze_ok_in(&repo.other, &["guard", "install", "--with-pull-hooks"]);
+
+        let contents = fs::read_to_string(hook(&repo, "post-merge")).unwrap();
+        let main = fs::canonicalize(&repo.main).unwrap();
+        let other = fs::canonicalize(&repo.other).unwrap();
+        assert!(
+            contents.contains(&format!("REPO='{}'", main.display())),
+            "{contents}"
+        );
+        assert!(
+            !contents.contains(&format!("REPO='{}'", other.display())),
+            "the hook embedded the linked worktree: {contents}"
+        );
+
+        git_ok(
+            &repo,
+            &repo.main,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                repo.other.to_str().unwrap(),
+            ],
+        );
+        break_link(&repo);
+        let output = Command::new(hook(&repo, "post-merge"))
+            .arg("1")
+            .current_dir(&repo.main)
+            .env("XDG_DATA_HOME", &repo.data)
+            .env("XDG_CACHE_HOME", repo.base.join("cache"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(
+            link_present(&repo, &repo.main),
+            "the hook stopped working after the linked worktree was removed"
+        );
+    }
+
+    #[test]
+    fn hooks_warn_when_the_embedded_repository_is_stale() {
+        let repo = TempRepo::new("guard-stale-root");
+        repo.breeze_ok(&["guard", "install", "--with-pull-hooks"]);
+
+        let installed = hook(&repo, "post-merge");
+        let contents = fs::read_to_string(&installed).unwrap();
+        let stale = contents
+            .lines()
+            .map(|line| {
+                if line.starts_with("REPO=") {
+                    "REPO='/nonexistent/breeze-repo'".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&installed, format!("{stale}\n")).unwrap();
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = Command::new(&installed)
+            .arg("1")
+            .current_dir(&repo.main)
+            .env("XDG_DATA_HOME", &repo.data)
+            .env("XDG_CACHE_HOME", repo.base.join("cache"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot read the Breeze store"), "{stderr}");
+    }
+
+    #[test]
     fn with_all_hooks_installs_the_full_set_and_pull_flags_stay_scoped() {
         let repo = TempRepo::new("guard-all-hooks");
         let hooks = repo.main.join(".git/hooks");
@@ -1319,7 +1392,39 @@ mod tests {
     }
 
     #[test]
-    fn pre_rebase_blocks_while_patches_are_active_and_allows_after_revert() {
+    fn dirty_patch_stops_rebase_before_the_hook_without_losing_data() {
+        let repo = TempRepo::new("guard-pre-rebase-dirty");
+        commit_file(&repo, "fog.json", "base\n");
+        let editor = write_editor(&repo, "guard-rebase-dirty", "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        repo.git(&repo.other, &["merge", "main"]);
+
+        fs::write(repo.other.join("feature.txt"), "feature\n").unwrap();
+        repo.git(&repo.other, &["add", "feature.txt"]);
+        repo.git(&repo.other, &["commit", "-m", "feature"]);
+        repo.breeze_ok(&["guard", "install", "--with-all-hooks"]);
+
+        // Current Git rejects the dirty worktree before it invokes pre-rebase,
+        // so this is the normal path for an applied patch. The hook cannot run.
+        let output = git_failure(&repo, &repo.main, &["rebase", "feature"]);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("unstaged changes") || combined.contains("dirty"),
+            "{combined}"
+        );
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\nlocal\n");
+        let status = repo.breeze_ok(&["status", "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(value["patched"].as_array().unwrap().len(), 1, "{status}");
+        assert_eq!(value["patched"][0]["path"], "fog.json");
+    }
+
+    #[test]
+    fn pre_rebase_blocks_a_committed_patch_and_preserves_content_and_record() {
         let repo = TempRepo::new("guard-pre-rebase-block");
         commit_file(&repo, "fog.json", "base\n");
         let editor = write_editor(&repo, "guard-rebase-edit", "printf 'local\\n' >> \"$1\"");
@@ -1331,8 +1436,9 @@ mod tests {
         repo.git(&repo.other, &["commit", "-m", "feature"]);
         repo.breeze_ok(&["guard", "install", "--with-all-hooks"]);
 
-        // Git refuses a dirty worktree before it runs pre-rebase, so commit the
-        // patched content (bypassing the guard) to exercise the hook itself.
+        // The hook only runs on a clean worktree, which requires committing the
+        // patched content (bypassing the guard). This is the only state where
+        // pre-rebase can speak.
         git_ok(&repo, &repo.main, &["add", "fog.json"]);
         git_ok(
             &repo,
@@ -1343,43 +1449,15 @@ mod tests {
         let output = git_failure(&repo, &repo.main, &["rebase", "feature"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("breeze revert --all"), "{stderr}");
-        assert!(
-            repo.read(&repo.main, "fog.json").contains("local"),
-            "the patch was silently discarded"
-        );
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\nlocal\n");
+        let status = repo.breeze_ok(&["status", "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(value["patched"].as_array().unwrap().len(), 1, "{status}");
 
         // Reverting removes the patch; restore the committed content so the
         // worktree is clean, then pre-rebase allows the rebase.
         repo.breeze_ok(&["revert", "--all"]);
         git_ok(&repo, &repo.main, &["checkout", "--", "fog.json"]);
-        git_ok(&repo, &repo.main, &["rebase", "feature"]);
-    }
-
-    #[test]
-    fn pre_rebase_auto_revert_restores_patches_and_allows_rebase() {
-        let repo = TempRepo::new("guard-pre-rebase-auto");
-        commit_file(&repo, "fog.json", "base\n");
-        let editor = write_editor(&repo, "guard-auto-edit", "printf 'local\\n' >> \"$1\"");
-        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
-        repo.git(&repo.other, &["merge", "main"]);
-
-        fs::write(repo.other.join("feature.txt"), "feature\n").unwrap();
-        repo.git(&repo.other, &["add", "feature.txt"]);
-        repo.git(&repo.other, &["commit", "-m", "feature"]);
-        repo.breeze_ok(&[
-            "guard",
-            "install",
-            "--with-all-hooks",
-            "--rebase-auto-revert",
-        ]);
-
-        // Exercise the hook body directly: a normal Git rebase refuses the
-        // dirty worktree before invoking pre-rebase on current Git versions.
-        repo.breeze_ok(&["guard", "check-rebase", "--auto-revert"]);
-        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
-        let status = repo.breeze_ok(&["status", "--json"]);
-        assert!(!status.contains("\"patched\":[{"), "{status}");
-
         git_ok(&repo, &repo.main, &["rebase", "feature"]);
     }
 

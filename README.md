@@ -83,7 +83,7 @@ Global flags accepted by every command:
 | `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
-| `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks] [--rebase-auto-revert]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, `pre-rebase`). `--rebase-auto-revert` lets `pre-rebase` revert active patches instead of blocking. |
+| `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, and a best-effort `pre-rebase`). |
 | `breeze guard uninstall` | Remove managed hooks and restore backed-up hooks. |
 | `breeze guard status` | Report installed hooks and backups. |
 | `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. |
@@ -111,21 +111,28 @@ opt-in; `--with-all-hooks` installs every hook Breeze knows how to use.
 | none | `pre-commit`, `pre-push` | Block local-only paths from being committed or pushed. |
 | `--with-post-checkout` | `post-checkout` | Sync after a branch/worktree checkout. |
 | `--with-pull-hooks` | `post-merge`, `post-rewrite` | Sync after a merge, pull, rebase or amend. |
-| `--with-all-hooks` | all of the above plus `post-applypatch`, `pre-rebase` | Full coverage for local history operations. |
-| `--rebase-auto-revert` | modifies `pre-rebase` | Revert active patches before rebasing instead of blocking. Requires `--with-all-hooks`. |
+| `--with-all-hooks` | all of the above plus `post-applypatch`, `pre-rebase` | Adds the remaining opt-in hooks; `pre-rebase` is best effort. |
 
-Every managed hook embeds the absolute path of the `breeze` binary that
-installed it, shell-quoted, and never looks up `breeze` on `PATH`. A GUI or IDE
-Git launch with a minimal environment therefore runs the same binary, and a
-different `breeze` earlier on `PATH` is never executed. If the embedded binary
-has been moved or deleted, the hook prints one warning and exits `0`;
-reinstall after moving or replacing the binary.
+The sync and guard hooks embed the absolute path of the `breeze` binary that
+installed them and the main worktree root, shell-quoted, and never look up
+`breeze` on `PATH`; `pre-rebase` uses the worktree Git is rebasing. A GUI or IDE Git launch with a minimal environment therefore
+runs the same binary, and a different `breeze` earlier on `PATH` is never
+executed. Because hooks live in the shared Git directory, installing from a
+linked worktree still embeds the main worktree, so removing the linked worktree
+does not break the hooks.
+
+If the embedded binary has been moved or deleted, the hook prints one warning
+and exits `0`; reinstall after moving or replacing the binary. If `breeze
+status` fails for a reason other than an uninitialized repository (exit `4`) —
+for example because the embedded root no longer exists — the hook prints a
+warning naming the stale root and exits `0`. Reinstall from the current
+checkout after moving a repository.
 
 The opt-in hooks are best effort. They first run `breeze status` with the
-embedded binary and exit `0` silently unless the repository is initialized.
-They suppress sync output and always exit `0`; when a patch cannot be applied
-they print `breeze: patch sync needs attention; run breeze doctor` to stderr so
-the Git operation still completes.
+embedded binary and exit `0` silently when the repository has never been
+initialized. They suppress sync output and always exit `0`; when a patch cannot
+be applied they print `breeze: patch sync needs attention; run breeze doctor`
+to stderr so the Git operation still completes.
 
 - `post-checkout` syncs only when Git's third argument is `1` (branch or
   worktree checkout). For a file checkout (`git checkout -- <file>`,
@@ -135,10 +142,14 @@ the Git operation still completes.
   `post-rewrite` serves both rebases and `git commit --amend`; `post-applypatch`
   runs after a successful `git am`.
 - `pre-rebase` lists active tracked patches and blocks with exit `6`, pointing
-  at `breeze revert --all`, unless `--rebase-auto-revert` was installed. It
-  allows the rebase when no patches are active. Git may reject a dirty worktree
-  before invoking this hook, so an applied patch usually aborts the rebase
-  before Breeze can speak; the patch is not lost in that case.
+  at `breeze revert --all`, and allows the rebase when no patches are active.
+  This is best effort: Git rejects a dirty worktree before running any
+  `pre-rebase` hook, so a normal applied patch aborts with Git's own
+  "unstaged changes" error before Breeze can speak. Neither the patch content
+  nor its record is changed in that case. There is no auto-revert or suspend
+  mode: `breeze revert` deletes the record, and running it from `pre-rebase`
+  would leave the worktree dirty and make Git abort the rebase anyway. Run
+  `breeze revert --all` explicitly before rebasing.
 - `pre-merge-commit` and `pre-applypatch` are deliberately not installed:
   they run before the index/worktree is complete, so they cannot decide safely
   whether to sync, and `post-merge`/`post-applypatch` cover the success case.
@@ -150,7 +161,8 @@ Existing hooks with the same names are backed up as `<hook>.breeze-backup` and
 chained with their original arguments and stdin. Reinstalling is idempotent and
 never overwrites a backup. Breeze refuses to install when `core.hooksPath`
 points somewhere else. Hooks live in the shared Git directory, so one install
-covers every worktree; new clones need their own install.
+covers every worktree; installing from a linked worktree is supported and
+embeds the main worktree root. New clones need their own install.
 
 ### Git operation matrix
 
@@ -174,10 +186,10 @@ that operation and Breeze does not claim coverage.
 | `reset --mixed` | none | — | Worktree keeps patch content; index resets; next sync/commit needs care. |
 | `stash`/`stash pop` | none | — | Stash may capture patch content; pop conflicts are yours to resolve, then sync/edit. |
 | `clean -fdx` / `-fdX` | none | — | Deletes ignored link symlinks; run `breeze sync --all`. Patched tracked files are not removed. |
-| `cherry-pick` | none | — | No sync; resolve conflicts, then `breeze sync --all`. |
-| `revert` (Git) | none | — | New commit may conflict with patches; sync or edit afterward. |
-| `apply` (plain) | none | — | No post hook at all; run `breeze sync --all` manually. |
-| `am` | `post-applypatch` | Syncs after each successful patch. | A failed series ends before the hook; sync manually. |
+| `cherry-pick` | `pre-commit` | Git runs `pre-commit` for each picked commit, so staged local-only paths are blocked. | Breeze installs no post-commit hook; resolve conflicts and run `breeze sync --all` manually. |
+| `revert` (Git) | `pre-commit` | Git runs `pre-commit` for the new revert commit, blocking staged local-only paths. | No Breeze post-commit sync; run `breeze sync --all`, then `breeze edit` if a patch base drifted. |
+| `apply` (plain) | none | — | No hook at all; run `breeze sync --all` manually. |
+| `am` | `pre-commit`, `post-applypatch` | Git runs `pre-commit` per patch and Breeze syncs after each successful patch. | A failed series ends before `post-applypatch`; sync manually. |
 | `worktree add` | `post-checkout` (arg `1`) | Hydrates links and patches in the new worktree. | Untracked files not managed by Breeze are not copied. |
 | `worktree remove/move` | none | — | Store entries go stale; `breeze gc` prunes removed worktrees. |
 | `filter-repo`/`filter-branch` | none | — | Rewrites patch bases; revert patches before filtering, then re-edit. |
@@ -199,14 +211,20 @@ that operation and Breeze does not claim coverage.
 - `--no-verify` bypasses the commit and push guards, and a custom
   `core.hooksPath` is refused rather than fought. Server-side push protection
   remains the authoritative safeguard.
-- The embedded repository root and binary path become stale if the repository
-  or Breeze binary moves; rerun `breeze guard install`. A fresh clone has no
-  hooks at all.
+- The embedded main-worktree root and binary path become stale if the
+  repository or Breeze binary moves; the next hook warns and no-ops, so rerun
+  `breeze guard install` from the current checkout. A fresh clone has no hooks
+  at all.
 - When `breeze sync` reports a conflict, resolve the file, run `breeze edit`
   on it to refresh the patch base, and retry. `breeze doctor` reports stale
   patches whose base no longer matches `HEAD`.
-- `pre-rebase` cannot protect a worktree Git already considers dirty, and
-  `post-checkout` cannot reapply patches on a file restore by design.
+- `pre-rebase` cannot protect a worktree Git already considers dirty, which is
+  the normal state of an applied patch, and `post-checkout` cannot reapply
+  patches on a file restore by design.
+- There is no safe automatic patch suspension for rebases. `breeze revert`
+  removes records rather than suspending them, so automatic reverting inside
+  `pre-rebase` is not offered; use `breeze revert --all` explicitly, rebase,
+  then re-apply with `breeze edit`/`breeze sync`.
 - There is no `breeze git`/`breeze pull` wrapper in this version; the manual
   recovery for any uncovered operation is `breeze sync --all`, plus
   `breeze revert --all` before history rewrites and `breeze edit` after
