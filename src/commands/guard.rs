@@ -442,8 +442,12 @@ exit 0
 fn post_checkout_script(binary: &str, root: &str, installed: &str) -> String {
     let template = r#"#!/bin/sh
 # breeze-managed (installed __INSTALLED__)
-# Opt-in post-checkout hook: hydrate overlays after a branch or worktree checkout.
-# Git also calls this for file checkouts ($3 = 0); those must not reapply patches.
+# Opt-in post-checkout hook: repair overlay links after a branch or worktree checkout.
+# It must not apply tracked patches: Git also runs post-checkout for its own
+# internal checkouts during rebase/cherry-pick/revert, where applying a patch
+# can dirty the worktree and abort the operation. Patches are applied by an
+# explicit `breeze sync`, or by post-merge/post-rewrite/post-applypatch.
+# Git calls this for file checkouts ($3 = 0); those must not reapply patches either.
 # Breeze must never fail the checkout, so every step is best effort.
 BREEZE=__BINARY__
 REPO=__REPO__
@@ -458,8 +462,8 @@ if [ "$3" = "1" ]; then
       :
     elif [ "$status" -ne 0 ]; then
       printf 'breeze: cannot read the Breeze store for %s (status exited %s); reinstall the hooks after moving the repository.\n' "$REPO" "$status" >&2
-    elif ! "$BREEZE" --repo "$REPO" --quiet sync --all; then
-      printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
+    elif ! "$BREEZE" --repo "$REPO" --quiet sync --all --links-only; then
+      printf 'breeze: overlay sync needs attention; run breeze doctor\n' >&2
     fi
   fi
 fi
@@ -745,9 +749,9 @@ mod tests {
         assert!(contents.contains("BREEZE='"), "{contents}");
         assert!(!contents.contains("command -v breeze"), "{contents}");
         assert!(contents.contains("\"$3\" = \"1\""), "{contents}");
-        assert!(contents.contains("sync --all"), "{contents}");
+        assert!(contents.contains("sync --all --links-only"), "{contents}");
         assert!(
-            contents.contains("patch sync needs attention"),
+            contents.contains("overlay sync needs attention"),
             "{contents}"
         );
         assert!(hooks.join("post-checkout.breeze-backup").is_file());
@@ -1113,11 +1117,12 @@ mod tests {
     }
 
     #[test]
-    fn post_checkout_skips_file_checkouts_and_syncs_branch_checkouts() {
+    fn post_checkout_skips_file_checkouts_and_repairs_links_only() {
         let repo = TempRepo::new("guard-post-checkout-file");
         commit_file(&repo, "fog.json", "base\n");
         let editor = write_editor(&repo, "guard-checkout-add", "printf 'local\\n' >> \"$1\"");
         repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        make_link(&repo);
         repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
 
         // A file checkout restores HEAD content; the hook must not reapply
@@ -1125,9 +1130,78 @@ mod tests {
         git_ok(&repo, &repo.main, &["checkout", "--", "fog.json"]);
         assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
 
-        // A branch checkout does sync, so the shared patch comes back.
+        // Branch checkouts repair links but do not apply tracked patches;
+        // Git also runs post-checkout for internal rebase/cherry-pick checkouts.
+        break_link(&repo);
         git_ok(&repo, &repo.main, &["checkout", "-b", "guard-other"]);
-        assert_eq!(repo.read(&repo.main, "fog.json"), "base\nlocal\n");
+        assert!(
+            link_present(&repo, &repo.main),
+            "post-checkout did not repair the link"
+        );
+        assert_eq!(
+            repo.read(&repo.main, "fog.json"),
+            "base\n",
+            "post-checkout must not apply tracked patches"
+        );
+    }
+
+    fn record_patch_at_base(repo: &TempRepo, label: &str) {
+        commit_file(repo, "fog.json", "base\n");
+        let editor = write_editor(repo, label, "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+    }
+
+    fn assert_patch_active(repo: &TempRepo) {
+        let status = repo.breeze_ok(&["status", "--json"]);
+        let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+        assert_eq!(value["patched"].as_array().unwrap().len(), 1, "{status}");
+        assert_eq!(value["patched"][0]["path"], "fog.json");
+    }
+
+    #[test]
+    fn post_checkout_does_not_apply_patches_during_rebase() {
+        let repo = TempRepo::new("guard-checkout-rebase");
+        record_patch_at_base(&repo, "guard-checkout-rebase-edit");
+        fs::write(repo.other.join("feature.txt"), "feature\n").unwrap();
+        repo.git(&repo.other, &["add", "feature.txt"]);
+        repo.git(&repo.other, &["commit", "-m", "feature"]);
+        repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
+
+        // Without links-only, post-checkout would apply the patch during the
+        // rebase's initial checkout and Git would abort on a dirty worktree.
+        git_ok(&repo, &repo.main, &["rebase", "feature"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+        assert_patch_active(&repo);
+    }
+
+    #[test]
+    fn post_checkout_does_not_apply_patches_during_cherry_pick() {
+        let repo = TempRepo::new("guard-checkout-cherry-pick");
+        record_patch_at_base(&repo, "guard-checkout-cherry-edit");
+        fs::write(repo.other.join("feature.txt"), "feature\n").unwrap();
+        repo.git(&repo.other, &["add", "feature.txt"]);
+        repo.git(&repo.other, &["commit", "-m", "feature"]);
+        repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
+
+        git_ok(&repo, &repo.main, &["cherry-pick", "feature"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+        assert_patch_active(&repo);
+    }
+
+    #[test]
+    fn post_checkout_does_not_apply_patches_during_revert() {
+        let repo = TempRepo::new("guard-checkout-revert");
+        record_patch_at_base(&repo, "guard-checkout-revert-edit");
+        fs::write(repo.main.join("feature.txt"), "feature\n").unwrap();
+        repo.git(&repo.main, &["add", "feature.txt"]);
+        repo.git(&repo.main, &["commit", "-m", "feature"]);
+        repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
+
+        git_ok(&repo, &repo.main, &["revert", "HEAD", "--no-edit"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+        assert_patch_active(&repo);
     }
 
     #[test]

@@ -184,6 +184,10 @@ pub struct SyncArgs {
     /// Report what would change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Repair link overlays only; do not apply tracked patches.
+    #[arg(long)]
+    pub links_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -311,7 +315,8 @@ pub enum GuardCommand {
 
 #[derive(Debug, Args)]
 pub struct GuardInstallArgs {
-    /// Also install the opt-in post-checkout hook that runs `breeze sync`.
+    /// Also install the opt-in post-checkout hook that repairs link overlays
+    /// without applying tracked patches.
     #[arg(long)]
     pub with_post_checkout: bool,
 
@@ -320,8 +325,8 @@ pub struct GuardInstallArgs {
     #[arg(long)]
     pub with_pull_hooks: bool,
 
-    /// Install every opt-in hook: post-checkout, post-merge, post-rewrite,
-    /// post-applypatch and pre-rebase.
+    /// Install every opt-in hook: post-checkout (links only), post-merge,
+    /// post-rewrite, post-applypatch and pre-rebase.
     #[arg(long)]
     pub with_all_hooks: bool,
 }

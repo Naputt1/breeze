@@ -1,4 +1,6 @@
 //! `breeze sync` — apply stored patches and repair overlay symlinks.
+//! `--links-only` repairs links without touching tracked patches; the
+//! post-checkout hook uses it so internal Git checkouts cannot dirty a worktree.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -43,6 +45,13 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
         return Ok(exit::SUCCESS);
     }
 
+    if args.links_only && links.is_empty() {
+        if !ctx.quiet {
+            println!("no link overlays recorded");
+        }
+        return Ok(exit::SUCCESS);
+    }
+
     let targets = if args.all {
         repo.worktree_targets(false)
     } else {
@@ -53,17 +62,19 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
     let mut conflicts = 0usize;
     let mut changes = 0usize;
 
-    for path in &entry_paths(&patches) {
-        let path_entries: Vec<&OverrideEntry> =
-            patches.iter().filter(|entry| &entry.path == path).collect();
-        for target in &targets {
-            match sync_patch(&repo, path, &path_entries, target, args.dry_run) {
-                Ok(PatchChange::Unchanged) => {}
-                Ok(PatchChange::Applied) => changes += 1,
-                Ok(PatchChange::Conflict) => conflicts += 1,
-                Err(err) => {
-                    eprintln!("error: failed to sync `{path}`: {err:#}");
-                    failures += 1;
+    if !args.links_only {
+        for path in &entry_paths(&patches) {
+            let path_entries: Vec<&OverrideEntry> =
+                patches.iter().filter(|entry| &entry.path == path).collect();
+            for target in &targets {
+                match sync_patch(&repo, path, &path_entries, target, args.dry_run) {
+                    Ok(PatchChange::Unchanged) => {}
+                    Ok(PatchChange::Applied) => changes += 1,
+                    Ok(PatchChange::Conflict) => conflicts += 1,
+                    Err(err) => {
+                        eprintln!("error: failed to sync `{path}`: {err:#}");
+                        failures += 1;
+                    }
                 }
             }
         }
@@ -342,5 +353,44 @@ mod tests {
         let contents = repo.read(&repo.other, "fog.json");
         assert!(contents.contains("<<<<<<<"), "{contents}");
         assert!(contents.contains(">>>>>>>"), "{contents}");
+    }
+
+    #[test]
+    fn sync_links_only_repairs_links_without_applying_patches() {
+        let repo = TempRepo::new("sync-links-only");
+        commit_file(&repo, "fog.json", "one\ntwo\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+
+        let editor = write_editor(
+            &repo,
+            "sync-links-only-add",
+            "printf 'one\\ntwo\\nlocal\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        repo.write("config/local.toml", "local config\n");
+        repo.breeze_ok(&["link", "config/local.toml"]);
+
+        let other_link = repo.other.join("config/local.toml");
+        std::fs::remove_file(&other_link).unwrap();
+        assert_eq!(repo.read(&repo.other, "fog.json"), "one\ntwo\n");
+
+        let output = repo.breeze_ok(&["sync", "--all", "--links-only"]);
+        assert!(
+            output.contains("linked") || output.contains("repaired"),
+            "{output}"
+        );
+        assert!(std::fs::symlink_metadata(&other_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            repo.read(&repo.other, "fog.json"),
+            "one\ntwo\n",
+            "--links-only must not apply tracked patches"
+        );
+
+        // A full sync still applies the patch afterwards.
+        repo.breeze_ok(&["sync", "--all"]);
+        assert_eq!(repo.read(&repo.other, "fog.json"), "one\ntwo\nlocal\n");
     }
 }
