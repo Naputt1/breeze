@@ -416,7 +416,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     message.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in message.chunks_exact(64) {
+    // The message is padded to a multiple of 64 bytes above, so every chunk
+    // is full. Avoid chunks_exact here: newer Clippy suggests as_chunks,
+    // which is newer than this crate's Rust 1.70 MSRV.
+    for chunk in message.chunks(64) {
         let mut w = [0u32; 64];
         for (index, word) in w.iter_mut().take(16).enumerate() {
             let base = index * 4;
