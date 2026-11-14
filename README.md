@@ -77,13 +77,13 @@ Global flags accepted by every command:
 | `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>]` | Edit a tracked file and record the result as a patch (default layer `branch`). |
 | `breeze sync [--all] [--path <PATH>] [--dry-run]` | Repair symlinks and re-apply patches. Defaults to the current worktree; `--all` covers every worktree. |
 | `breeze diff [PATH] [--stat]` | Show changes between overlays and the working tree. |
-| `breeze revert <PATH> [--force]` | Remove overlay changes for a file and restore tracked content. |
+| `breeze revert [<PATH>] [--all] [--force]` | Remove overlay changes for one file or every patch and restore tracked content. |
 | `breeze promote <PATH>` | Turn a recorded patch into ordinary tracked content, ready to commit. |
 | `breeze share <PATH>` | Move a branch or worktree override up to the shared layer. |
 | `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
-| `breeze guard install [--with-post-checkout] [--with-pull-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` additionally installs an opt-in hook that runs `breeze sync --all` after checkout and worktree creation. `--with-pull-hooks` installs opt-in `post-merge`/`post-rewrite` hooks that run `breeze sync --all` after pulls, merges, rebases and amends. |
+| `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks] [--rebase-auto-revert]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, `pre-rebase`). `--rebase-auto-revert` lets `pre-rebase` revert active patches instead of blocking. |
 | `breeze guard uninstall` | Remove managed hooks and restore backed-up hooks. |
 | `breeze guard status` | Report installed hooks and backups. |
 | `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. |
@@ -103,21 +103,114 @@ a shared patch applies to every branch and worktree on the next
 ### Guard hooks
 
 `breeze guard install` manages `pre-commit` and `pre-push` hooks that block
-commits and pushes containing local-only paths. Two hook families are opt-in:
+commits and pushes containing local-only paths. The other families are
+opt-in; `--with-all-hooks` installs every hook Breeze knows how to use.
 
-- `--with-post-checkout` installs `post-checkout`, which runs
-  `breeze sync --all` after a checkout or new worktree.
-- `--with-pull-hooks` installs `post-merge` and `post-rewrite`, which run
-  `breeze sync --all` after `git pull`/`git merge` and after `git rebase` or
-  `git commit --amend`.
+| Flag | Hooks | Purpose |
+| --- | --- | --- |
+| none | `pre-commit`, `pre-push` | Block local-only paths from being committed or pushed. |
+| `--with-post-checkout` | `post-checkout` | Sync after a branch/worktree checkout. |
+| `--with-pull-hooks` | `post-merge`, `post-rewrite` | Sync after a merge, pull, rebase or amend. |
+| `--with-all-hooks` | all of the above plus `post-applypatch`, `pre-rebase` | Full coverage for local history operations. |
+| `--rebase-auto-revert` | modifies `pre-rebase` | Revert active patches before rebasing instead of blocking. Requires `--with-all-hooks`. |
 
-The opt-in hooks are best effort. They do nothing unless `breeze` is on
-`PATH` and the repository is initialized. They suppress sync output and
-always exit `0`; when a patch cannot be applied they print
-`breeze: patch sync needs attention; run breeze doctor` to stderr so the pull
-or rewrite still completes. Existing hooks with the same names are backed up
-as `<hook>.breeze-backup` and chained. Breeze refuses to install when
-`core.hooksPath` points somewhere else.
+Every managed hook embeds the absolute path of the `breeze` binary that
+installed it, shell-quoted, and never looks up `breeze` on `PATH`. A GUI or IDE
+Git launch with a minimal environment therefore runs the same binary, and a
+different `breeze` earlier on `PATH` is never executed. If the embedded binary
+has been moved or deleted, the hook prints one warning and exits `0`;
+reinstall after moving or replacing the binary.
+
+The opt-in hooks are best effort. They first run `breeze status` with the
+embedded binary and exit `0` silently unless the repository is initialized.
+They suppress sync output and always exit `0`; when a patch cannot be applied
+they print `breeze: patch sync needs attention; run breeze doctor` to stderr so
+the Git operation still completes.
+
+- `post-checkout` syncs only when Git's third argument is `1` (branch or
+  worktree checkout). For a file checkout (`git checkout -- <file>`,
+  `git restore`) the third argument is `0`, and re-syncing would reapply the
+  patch over a deliberate restore, so the hook does nothing.
+- `post-merge`, `post-rewrite` and `post-applypatch` run `breeze sync --all`.
+  `post-rewrite` serves both rebases and `git commit --amend`; `post-applypatch`
+  runs after a successful `git am`.
+- `pre-rebase` lists active tracked patches and blocks with exit `6`, pointing
+  at `breeze revert --all`, unless `--rebase-auto-revert` was installed. It
+  allows the rebase when no patches are active. Git may reject a dirty worktree
+  before invoking this hook, so an applied patch usually aborts the rebase
+  before Breeze can speak; the patch is not lost in that case.
+- `pre-merge-commit` and `pre-applypatch` are deliberately not installed:
+  they run before the index/worktree is complete, so they cannot decide safely
+  whether to sync, and `post-merge`/`post-applypatch` cover the success case.
+- `post-commit` and `post-index-change` are deliberately not installed: they
+  fire for every commit and every index write (including Breeze's own work),
+  cannot restore lost content, and would add noise without preventing damage.
+
+Existing hooks with the same names are backed up as `<hook>.breeze-backup` and
+chained with their original arguments and stdin. Reinstalling is idempotent and
+never overwrites a backup. Breeze refuses to install when `core.hooksPath`
+points somewhere else. Hooks live in the shared Git directory, so one install
+covers every worktree; new clones need their own install.
+
+### Git operation matrix
+
+`sync` means `breeze sync --all`; "none" means there is no safe Git hook for
+that operation and Breeze does not claim coverage.
+
+| Operation | Hook | Behavior | Still at risk |
+| --- | --- | --- | --- |
+| `commit` | `pre-commit` | Blocks staged local-only paths (exit `6`). | `BREEZE_ALLOW_COMMIT=1` / `--no-verify` bypasses it. |
+| `commit --amend` | `pre-commit`, `post-rewrite` | Blocks overrides, then syncs after rewrite. | Amending changes the patch base; refresh with `breeze edit`. |
+| `push` | `pre-push` | Blocks pushed commits containing overrides. | `--no-verify`; server-side protection is authoritative. |
+| `merge` (FF and non-FF) | `post-merge` | Syncs after success. | Aborted/conflicted merges run no post hook; dirty patches can abort first. |
+| `pull` (merge, ff-only) | `post-merge` | Syncs after success. | Failed pulls run no post hook. |
+| `pull --rebase` | `post-rewrite`; `pre-rebase` if installed | Syncs after a successful rebase. | Conflicts/aborts run no post hook; dirty patches usually stop Git before `pre-rebase`. |
+| `rebase` success | `post-rewrite` | Syncs. | Patch may conflict; resolve, then `breeze edit` to refresh its base. |
+| `rebase` conflict/abort | none after; `pre-rebase` before | `pre-rebase` can block only if Git reaches it. | No sync after abort; run `breeze sync --all`. |
+| `checkout`/`switch` | `post-checkout` (arg `1`) | Syncs, rehydrating links and patches. | Dirty patches can make checkout abort. |
+| `checkout -- <file>` | `post-checkout` (arg `0`) | Intentionally does nothing. | Patch record stays active while the file is back at HEAD; use `breeze revert <file>`. |
+| `restore` | `post-checkout` (arg `0`) | Intentionally does nothing. | Same as above. |
+| `reset --hard` | none | — | Discards patched content; the patch record remains; use `breeze revert --force`. |
+| `reset --mixed` | none | — | Worktree keeps patch content; index resets; next sync/commit needs care. |
+| `stash`/`stash pop` | none | — | Stash may capture patch content; pop conflicts are yours to resolve, then sync/edit. |
+| `clean -fdx` / `-fdX` | none | — | Deletes ignored link symlinks; run `breeze sync --all`. Patched tracked files are not removed. |
+| `cherry-pick` | none | — | No sync; resolve conflicts, then `breeze sync --all`. |
+| `revert` (Git) | none | — | New commit may conflict with patches; sync or edit afterward. |
+| `apply` (plain) | none | — | No post hook at all; run `breeze sync --all` manually. |
+| `am` | `post-applypatch` | Syncs after each successful patch. | A failed series ends before the hook; sync manually. |
+| `worktree add` | `post-checkout` (arg `1`) | Hydrates links and patches in the new worktree. | Untracked files not managed by Breeze are not copied. |
+| `worktree remove/move` | none | — | Store entries go stale; `breeze gc` prunes removed worktrees. |
+| `filter-repo`/`filter-branch` | none | — | Rewrites patch bases; revert patches before filtering, then re-edit. |
+| `submodule update` | none | — | Submodules are not managed; `link` refuses them. |
+| `commit`/`push --no-verify` | none | Bypasses `pre-commit`/`pre-push`. | Post hooks still run; do not use it to force local overrides. |
+| GUI/IDE with minimal `PATH` | all installed hooks | Embedded absolute binary still runs. | If the binary moved, the hook warns and no-ops; reinstall. |
+
+### Residual risks and recovery
+
+- Aborted pulls and rebases do not run `post-merge`/`post-rewrite`. Run
+  `breeze sync --all` after resolving or aborting.
+- Dirty patched files can make `git pull`, `merge`, `checkout` or `rebase`
+  abort before any hook runs. Breeze never hides patch content to avoid this.
+- `git clean -fdx` and `git clean -fdX` delete ignored link symlinks. Run
+  `breeze sync --all` to recreate them from the store.
+- `git reset --hard`, `git restore` and `git checkout -- <file>` can discard
+  tracked patch content. The patch record is not automatically dropped; use
+  `breeze revert <file>` to remove it, or `breeze sync --all` to reapply it.
+- `--no-verify` bypasses the commit and push guards, and a custom
+  `core.hooksPath` is refused rather than fought. Server-side push protection
+  remains the authoritative safeguard.
+- The embedded repository root and binary path become stale if the repository
+  or Breeze binary moves; rerun `breeze guard install`. A fresh clone has no
+  hooks at all.
+- When `breeze sync` reports a conflict, resolve the file, run `breeze edit`
+  on it to refresh the patch base, and retry. `breeze doctor` reports stale
+  patches whose base no longer matches `HEAD`.
+- `pre-rebase` cannot protect a worktree Git already considers dirty, and
+  `post-checkout` cannot reapply patches on a file restore by design.
+- There is no `breeze git`/`breeze pull` wrapper in this version; the manual
+  recovery for any uncovered operation is `breeze sync --all`, plus
+  `breeze revert --all` before history rewrites and `breeze edit` after
+  resolving a patch conflict.
 
 ## Exit codes
 
@@ -176,10 +269,11 @@ An `exclude` block in `.git/info/exclude` keeps overlay paths out of
   followed.
 - The guard hooks block commits and pushes that include overridden paths,
   unless `BREEZE_ALLOW_COMMIT=1` is set. They chain to pre-existing hooks.
-- The post-checkout, post-merge and post-rewrite hooks are opt-in. They run
-  `breeze sync --all` best-effort and always exit `0`; a failing or conflicting
-  sync only prints a warning, so checkouts, pulls, rebases and amends never
-  fail because of Breeze.
+- The `post-checkout`, `post-merge`, `post-rewrite` and `post-applypatch`
+  hooks are opt-in. They run `breeze sync --all` best-effort and always exit
+  `0`; a failing or conflicting sync only prints a warning, so checkouts,
+  pulls, rebases, amends and `git am` never fail because of Breeze. They embed
+  the absolute `breeze` path and never execute a binary found on `PATH`.
 - `gc` never touches the current branch layer or files backing live overrides
   unless `--force` is given.
 - `promote` is the only command that turns local overlay content into tracked

@@ -199,11 +199,15 @@ pub struct DiffArgs {
 }
 
 #[derive(Debug, Args)]
-#[allow(dead_code)] // Consumed by Phase 1+ implementations.
+/// Revert tracked patch overlays to their Git content.
 pub struct RevertArgs {
     /// Repository-relative path to revert.
-    #[arg(value_name = "PATH")]
-    pub path: PathBuf,
+    #[arg(value_name = "PATH", required_unless_present = "all")]
+    pub path: Option<PathBuf>,
+
+    /// Revert every recorded patch overlay.
+    #[arg(long, conflicts_with = "path")]
+    pub all: bool,
 
     /// Discard local modifications without prompting.
     #[arg(long)]
@@ -299,6 +303,10 @@ pub enum GuardCommand {
 
     /// Show guard status.
     Status,
+
+    /// Internal pre-rebase check used by the installed hook.
+    #[command(hide = true)]
+    CheckRebase(CheckRebaseArgs),
 }
 
 #[derive(Debug, Args)]
@@ -311,6 +319,23 @@ pub struct GuardInstallArgs {
     /// `breeze sync` after pulls, merges, rebases and amends.
     #[arg(long)]
     pub with_pull_hooks: bool,
+
+    /// Install every opt-in hook: post-checkout, post-merge, post-rewrite,
+    /// post-applypatch and pre-rebase.
+    #[arg(long)]
+    pub with_all_hooks: bool,
+
+    /// With --with-all-hooks, let the pre-rebase hook run `breeze revert --all`
+    /// (with backups) instead of blocking the rebase.
+    #[arg(long, requires = "with_all_hooks")]
+    pub rebase_auto_revert: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CheckRebaseArgs {
+    /// Revert active patches instead of blocking the rebase.
+    #[arg(long)]
+    pub auto_revert: bool,
 }
 
 #[derive(Debug, Args)]
