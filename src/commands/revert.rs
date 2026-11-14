@@ -20,8 +20,44 @@ struct StoredPatch {
 
 pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
-    let relative = overlay::relative_lenient_path(&repo, &args.path)?;
+    if args.all {
+        return revert_all(&repo, ctx, args.force);
+    }
+    let path = args.path.as_ref().ok_or_else(|| {
+        CommandError::new(
+            exit::USAGE,
+            "specify a path or --all to revert every patch overlay",
+        )
+    })?;
+    let relative = overlay::relative_lenient_path(&repo, path)?;
+    revert_relative(&repo, ctx, &relative, args.force)
+}
 
+fn revert_all(repo: &Repo, ctx: &Ctx, force: bool) -> Result<i32> {
+    let overrides = repo.overrides()?;
+    let mut paths: Vec<String> = overrides
+        .overrides
+        .iter()
+        .filter(|entry| entry.mode == OverrideMode::Patch)
+        .map(|entry| entry.path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    if paths.is_empty() {
+        if !ctx.quiet {
+            println!("no patch overlays to revert");
+        }
+        return Ok(exit::SUCCESS);
+    }
+
+    for path in paths {
+        revert_relative(repo, ctx, &path, force)?;
+    }
+    Ok(exit::SUCCESS)
+}
+
+pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: bool) -> Result<i32> {
     let mut overrides = repo.overrides()?;
     let patch_entries: Vec<_> = overrides
         .overrides
@@ -80,7 +116,7 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
             )
         })?;
 
-    let current_path = repo.info.root.join(&relative);
+    let current_path = repo.info.root.join(relative);
     let current_hash = patches::file_hash(&current_path);
     let applied_hash = current_stored.metadata.applied_hash.as_str();
     let base_hash = patches::hash_bytes(&current_stored.base);
@@ -90,7 +126,7 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
     let missing = current_hash.is_none();
     let diverged = !missing && !at_applied && !at_base;
 
-    if diverged && !args.force {
+    if diverged && !force {
         return Err(CommandError::new(
             exit::UNSAFE_REFUSED,
             format!(
@@ -102,7 +138,7 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
     }
 
     let mut backups = Vec::new();
-    if diverged && args.force {
+    if diverged && force {
         backups.push(repo.backup_file(&current_path)?);
     }
 
@@ -125,7 +161,7 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
             continue;
         };
 
-        let file = target.path.join(&relative);
+        let file = target.path.join(relative);
         let Some(hash) = patches::file_hash(&file) else {
             continue;
         };
@@ -154,7 +190,7 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
         .overrides
         .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Patch));
     repo.save_overrides(&overrides)?;
-    repo.log_event("revert", &relative)?;
+    repo.log_event("revert", relative)?;
 
     if !ctx.quiet {
         println!(

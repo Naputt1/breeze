@@ -579,8 +579,7 @@ mod tests {
                 // expected port comes from the last overlay entry with `name`.
                 let expected = overlay_entries
                     .iter()
-                    .filter(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
-                    .last()
+                    .rfind(|entry| entry.get("name").and_then(Value::as_str) == Some(name))
                     .and_then(|entry| entry.get("port"));
                 let found = entries
                     .iter()

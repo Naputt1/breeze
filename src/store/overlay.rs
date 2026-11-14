@@ -816,7 +816,21 @@ pub mod testutil {
     }
 
     /// Path of the `breeze` binary built alongside the test harness.
+    ///
+    /// CI sets `BREEZE_BIN` explicitly: newer Cargo versions can place the
+    /// unit-test harness under `target/debug/build/...`, where walking up from
+    /// `current_exe()` no longer lands on `target/debug/`.
     pub fn breeze_bin() -> PathBuf {
+        if let Some(path) = std::env::var_os("BREEZE_BIN") {
+            let binary = PathBuf::from(path);
+            assert!(
+                binary.is_file(),
+                "breeze binary not found at {}; run `cargo build` before `cargo test`",
+                binary.display()
+            );
+            return binary;
+        }
+
         let mut path = std::env::current_exe().expect("current test executable");
         path.pop();
         if path.file_name().map(|name| name == "deps").unwrap_or(false) {

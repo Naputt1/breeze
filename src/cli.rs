@@ -184,6 +184,10 @@ pub struct SyncArgs {
     /// Report what would change without writing anything.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Repair link overlays only; do not apply tracked patches.
+    #[arg(long)]
+    pub links_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -199,11 +203,15 @@ pub struct DiffArgs {
 }
 
 #[derive(Debug, Args)]
-#[allow(dead_code)] // Consumed by Phase 1+ implementations.
+/// Revert tracked patch overlays to their Git content.
 pub struct RevertArgs {
     /// Repository-relative path to revert.
-    #[arg(value_name = "PATH")]
-    pub path: PathBuf,
+    #[arg(value_name = "PATH", required_unless_present = "all")]
+    pub path: Option<PathBuf>,
+
+    /// Revert every recorded patch overlay.
+    #[arg(long, conflicts_with = "path")]
+    pub all: bool,
 
     /// Discard local modifications without prompting.
     #[arg(long)]
@@ -299,13 +307,28 @@ pub enum GuardCommand {
 
     /// Show guard status.
     Status,
+
+    /// Internal pre-rebase check used by the installed hook.
+    #[command(hide = true)]
+    CheckRebase,
 }
 
 #[derive(Debug, Args)]
 pub struct GuardInstallArgs {
-    /// Also install the opt-in post-checkout hook that runs `breeze sync`.
+    /// Also install the opt-in post-checkout hook that repairs link overlays
+    /// without applying tracked patches.
     #[arg(long)]
     pub with_post_checkout: bool,
+
+    /// Also install the opt-in post-merge and post-rewrite hooks that run
+    /// `breeze sync` after pulls, merges, rebases and amends.
+    #[arg(long)]
+    pub with_pull_hooks: bool,
+
+    /// Install every opt-in hook: post-checkout (links only), post-merge,
+    /// post-rewrite, post-applypatch and pre-rebase.
+    #[arg(long)]
+    pub with_all_hooks: bool,
 }
 
 #[derive(Debug, Args)]
