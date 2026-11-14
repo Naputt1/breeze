@@ -31,8 +31,21 @@ pub struct OverrideEntry {
     pub tracked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,
+    /// Optional human-readable patch name, unique per repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl OverrideEntry {
+    /// `name (path)` for named patches, otherwise the bare path.
+    pub fn label(&self) -> String {
+        match &self.name {
+            Some(name) => format!("{name} ({})", self.path),
+            None => self.path.clone(),
+        }
+    }
 }
 
 /// Contents of `state/overrides.json`.

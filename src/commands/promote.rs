@@ -28,11 +28,19 @@ pub fn run(ctx: &Ctx, args: &PromoteArgs) -> Result<i32> {
         .into());
     }
 
+    let archived = crate::commands::archive::archive_entries(&repo, &entries)?;
+
     crate::commands::edit::remove_patch_entries(&repo, &mut overrides, &relative)?;
     repo.save_overrides(&overrides)?;
     repo.log_event("promote", &relative)?;
 
     if !ctx.quiet {
+        for record in &archived {
+            println!(
+                "archived patch '{}' → backups/patches/{}.patch",
+                record.name, record.name
+            );
+        }
         println!("promoted {relative}: the local modification stays in the working tree");
         println!("next:");
         println!("  git add {relative}");
@@ -78,5 +86,38 @@ mod tests {
 
         let status = repo.git(&repo.main, &["status", "--porcelain"]);
         assert!(status.contains("fog.json"), "{status}");
+    }
+
+    #[test]
+    fn promote_archives_the_patch_before_removing_it() {
+        let repo = TempRepo::new("promote-archive");
+        repo.write("fog.json", "base\n");
+        repo.git(&repo.main, &["add", "fog.json"]);
+        repo.git(&repo.main, &["commit", "-m", "add fog"]);
+
+        let editor = repo.base.join("promote-archive-editor.sh");
+        fs::write(&editor, "#!/bin/sh\nprintf 'local\\n' >> \"$1\"\n").unwrap();
+        fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "promote-me",
+            "--editor",
+            editor.to_str().unwrap(),
+        ]);
+
+        let output = repo.breeze_ok(&["promote", "fog.json"]);
+        assert!(
+            output.contains("archived patch 'promote-me' → backups/patches/promote-me.patch"),
+            "{output}"
+        );
+        let archive = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main))
+            .join("backups/patches/promote-me.patch");
+        assert!(archive.is_file(), "missing {}", archive.display());
+        assert!(archive.with_extension("json").is_file());
     }
 }

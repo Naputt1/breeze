@@ -436,6 +436,7 @@ mod tests {
             source: "shared/files/config/local.toml".to_string(),
             tracked: true,
             base_sha: Some("deadbeef".to_string()),
+            name: Some("local-toml".to_string()),
             created_at: now.clone(),
             updated_at: now,
         });
@@ -451,6 +452,96 @@ mod tests {
         if cfg!(unix) {
             assert_eq!(mode_of(&path), 0o600);
         }
+    }
+
+    #[test]
+    fn overrides_without_a_name_load_and_omit_the_field() {
+        let temp = TempDir::new("overrides-name");
+        let path = temp.path().join("overrides.json");
+        fs::write(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "overrides": [
+    {
+      "path": "a.json",
+      "mode": "patch",
+      "layer": "shared",
+      "source": "shared/patches/a.json.patch",
+      "tracked": true,
+      "base_sha": "deadbeef",
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:00Z"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let file = overrides::OverridesFile::load(&path).expect("load legacy overrides");
+        assert!(file.overrides[0].name.is_none());
+
+        let saved = temp.path().join("saved.json");
+        file.save(&saved).expect("save overrides");
+        let text = fs::read_to_string(&saved).unwrap();
+        assert!(!text.contains("\"name\""), "{text}");
+        assert!(text.contains("\"schema_version\": 1"), "{text}");
+    }
+
+    #[test]
+    fn patch_metadata_roundtrips_with_and_without_a_name() {
+        let temp = TempDir::new("patch-name");
+        let now = now_rfc3339();
+
+        let named_path = temp.path().join("named.json");
+        patches::write_metadata(
+            &named_path,
+            &patches::PatchMetadata {
+                path: "fog.json".to_string(),
+                base_sha: "deadbeef".to_string(),
+                base_blob: "cafebabe".to_string(),
+                applied_hash: "sha256:00".to_string(),
+                name: Some("api-timeout".to_string()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .expect("write named metadata");
+        let named = patches::read_metadata(&named_path).expect("read named metadata");
+        assert_eq!(named.name.as_deref(), Some("api-timeout"));
+
+        let unnamed_path = temp.path().join("unnamed.json");
+        patches::write_metadata(
+            &unnamed_path,
+            &patches::PatchMetadata {
+                path: "fog.json".to_string(),
+                base_sha: "deadbeef".to_string(),
+                base_blob: "cafebabe".to_string(),
+                applied_hash: "sha256:00".to_string(),
+                name: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("write unnamed metadata");
+        let text = fs::read_to_string(&unnamed_path).unwrap();
+        assert!(!text.contains("\"name\""), "{text}");
+
+        let legacy_path = temp.path().join("legacy.json");
+        fs::write(
+            &legacy_path,
+            r#"{
+  "path": "fog.json",
+  "base_sha": "deadbeef",
+  "base_blob": "cafebabe",
+  "applied_hash": "sha256:00",
+  "created_at": "2026-01-01T00:00:00Z",
+  "updated_at": "2026-01-01T00:00:00Z"
+}"#,
+        )
+        .unwrap();
+        let legacy = patches::read_metadata(&legacy_path).expect("read legacy metadata");
+        assert!(legacy.name.is_none());
     }
 
     #[test]

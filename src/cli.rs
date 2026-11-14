@@ -94,6 +94,12 @@ pub enum Command {
     /// Revert a file to its tracked content.
     Revert(RevertArgs),
 
+    /// Restore an archived patch.
+    Restore(RestoreArgs),
+
+    /// List active and archived patches.
+    Patches,
+
     /// Promote an overlay file into tracked content.
     Promote(PromoteArgs),
 
@@ -168,6 +174,10 @@ pub struct EditArgs {
     /// Editor command to use instead of $EDITOR.
     #[arg(long, value_name = "CMD")]
     pub editor: Option<String>,
+
+    /// Set or update the patch name.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -206,16 +216,32 @@ pub struct DiffArgs {
 /// Revert tracked patch overlays to their Git content.
 pub struct RevertArgs {
     /// Repository-relative path to revert.
-    #[arg(value_name = "PATH", required_unless_present = "all")]
+    #[arg(value_name = "PATH", required_unless_present_any = ["all", "name"])]
     pub path: Option<PathBuf>,
 
     /// Revert every recorded patch overlay.
     #[arg(long, conflicts_with = "path")]
     pub all: bool,
 
+    /// Revert the patch with this name.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["path", "all"])]
+    pub name: Option<String>,
+
     /// Discard local modifications without prompting.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+/// Re-apply an archived patch and record it again.
+pub struct RestoreArgs {
+    /// Archived patch name.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Layer to search when the name is archived in several layers.
+    #[arg(long, value_name = "LAYER")]
+    pub layer: Option<String>,
 }
 
 #[derive(Debug, Args)]

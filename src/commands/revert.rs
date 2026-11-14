@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::cli::RevertArgs;
-use crate::commands::Ctx;
+use crate::commands::{archive, Ctx};
 use crate::exit::{self, CommandError};
 use crate::store::overlay::{self, Repo};
 use crate::store::overrides::OverrideMode;
@@ -23,13 +23,25 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
     if args.all {
         return revert_all(&repo, ctx, args.force);
     }
-    let path = args.path.as_ref().ok_or_else(|| {
-        CommandError::new(
-            exit::USAGE,
-            "specify a path or --all to revert every patch overlay",
-        )
-    })?;
-    let relative = overlay::relative_lenient_path(&repo, path)?;
+    let relative = if let Some(name) = &args.name {
+        let overrides = repo.overrides()?;
+        let entry = overrides
+            .overrides
+            .iter()
+            .find(|entry| entry.mode == OverrideMode::Patch && entry.name.as_deref() == Some(name))
+            .ok_or_else(|| {
+                CommandError::new(exit::USAGE, format!("no patch overlay named `{name}`"))
+            })?;
+        entry.path.clone()
+    } else {
+        let path = args.path.as_ref().ok_or_else(|| {
+            CommandError::new(
+                exit::USAGE,
+                "specify a path, --name or --all to revert patch overlays",
+            )
+        })?;
+        overlay::relative_lenient_path(&repo, path)?
+    };
     revert_relative(&repo, ctx, &relative, args.force)
 }
 
@@ -142,6 +154,8 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
         backups.push(repo.backup_file(&current_path)?);
     }
 
+    let archived = archive::archive_entries(repo, &patch_entries)?;
+
     let mut restored = 0usize;
     if !at_base {
         write_base(&current_path, &current_stored.base)?;
@@ -193,6 +207,12 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
     repo.log_event("revert", relative)?;
 
     if !ctx.quiet {
+        for record in &archived {
+            println!(
+                "archived patch '{}' → backups/patches/{}.patch",
+                record.name, record.name
+            );
+        }
         println!(
             "reverted {relative}; removed {} patch override(s)",
             stored.len()
@@ -288,5 +308,79 @@ mod tests {
             }
         }
         assert!(found, "expected a backup of the diverged file");
+    }
+
+    #[test]
+    fn revert_archives_named_and_unnamed_patches_before_removing_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new("revert-archive");
+        commit_file(&repo, "fog.json", "base\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+
+        let editor = write_editor(&repo, "archive-add", "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-timeout",
+            "--editor",
+            &editor,
+        ]);
+
+        let output = repo.breeze_ok(&["revert", "--name", "api-timeout"]);
+        assert!(
+            output.contains("archived patch 'api-timeout' → backups/patches/api-timeout.patch"),
+            "{output}"
+        );
+
+        let layer_dir = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main));
+        let archive = layer_dir.join("backups/patches/api-timeout.patch");
+        let archive_meta = archive.with_extension("json");
+        assert!(archive.is_file(), "missing {}", archive.display());
+        assert!(archive_meta.is_file(), "missing {}", archive_meta.display());
+        assert_eq!(
+            fs::metadata(&archive).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(archive.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let sidecar = fs::read_to_string(&archive_meta).unwrap();
+        for key in [
+            "\"name\": \"api-timeout\"",
+            "\"path\": \"fog.json\"",
+            "\"layer\": \"branch\"",
+            "\"base_sha\"",
+            "\"base_blob\"",
+            "\"archived_at\"",
+        ] {
+            assert!(sidecar.contains(key), "missing {key}: {sidecar}");
+        }
+        assert!(!layer_dir.join("patches/fog.json.patch").exists());
+        let overrides = fs::read_to_string(repo.store_dir().join("state/overrides.json")).unwrap();
+        assert!(!overrides.contains("fog.json"), "{overrides}");
+
+        // An unnamed patch gets a path + content-hash fallback name.
+        repo.breeze_ok(&["edit", "fog.json", "--editor", &editor]);
+        repo.breeze_ok(&["revert", "fog.json"]);
+        let mut fallback = None;
+        for entry in fs::read_dir(layer_dir.join("backups/patches")).unwrap() {
+            let path = entry.unwrap().path();
+            let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+            if stem.starts_with("fog-json-") {
+                fallback = Some(stem);
+            }
+        }
+        let fallback = fallback.expect("fallback archive name");
+        assert_eq!(fallback.len(), "fog-json-".len() + 8, "{fallback}");
     }
 }

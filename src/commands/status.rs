@@ -71,7 +71,17 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         }
 
         if !stale.is_empty() {
-            println!("Stale:               {}", stale.join(", "));
+            let labels: Vec<String> = stale
+                .iter()
+                .map(|path| {
+                    patched
+                        .iter()
+                        .find(|entry| entry.path == *path)
+                        .map(|entry| entry.label())
+                        .unwrap_or_else(|| path.clone())
+                })
+                .collect();
+            println!("Stale:               {}", labels.join(", "));
         }
         println!("issues:              {issues}");
     }
@@ -88,19 +98,20 @@ fn view(entry: &OverrideEntry) -> Value {
         },
         "layer": entry.layer,
         "source": entry.source,
+        "name": entry.name,
     })
 }
 
 fn print_group(label: &str, layer: &str, entries: &[&OverrideEntry]) {
-    let paths: Vec<&str> = entries
+    let labels: Vec<String> = entries
         .iter()
         .filter(|entry| entry.layer == layer)
-        .map(|entry| entry.path.as_str())
+        .map(|entry| entry.label())
         .collect();
-    if paths.is_empty() {
+    if labels.is_empty() {
         return;
     }
-    println!("{label} ({layer}): {}", paths.join(", "));
+    println!("{label} ({layer}): {}", labels.join(", "));
 }
 
 /// Paths whose recorded patch base no longer matches the blob at `HEAD`.

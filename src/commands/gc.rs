@@ -86,6 +86,7 @@ pub fn run(ctx: &Ctx, args: &GcArgs) -> Result<i32> {
         .collect();
 
     changed |= clean_orphan_patches(&repo, &recorded, &mut report)?;
+    report_archives(&repo, &mut report);
 
     // Store files that no live link override points at.
     let live_files: BTreeSet<String> = overrides
@@ -275,6 +276,17 @@ fn clean_orphan_patches(
     Ok(changed)
 }
 
+/// Report archived patches. They are never deleted automatically.
+fn report_archives(repo: &Repo, report: &mut Vec<String>) {
+    for dir in repo.all_layer_dirs() {
+        for record in patches::list_archived(&dir) {
+            let files = patches::archive_files(&dir, &record.name);
+            let source = overlay::relative_string(&repo.layout.repo_dir, &files.patch);
+            report.push(format!("archived patch kept: {source}"));
+        }
+    }
+}
+
 /// Keep the five most recent backup directories when `--force` is set.
 fn prune_backups(repo: &Repo, report: &mut Vec<String>) -> Result<()> {
     let mut dirs = subdirs(&repo.layout.backups_dir)?;
@@ -343,6 +355,39 @@ mod tests {
     use std::process::Command;
 
     use crate::store::overlay::testutil::TempRepo;
+
+    use crate::commands::edit::tests::{commit_file, write_editor};
+
+    #[test]
+    fn gc_reports_archived_patches_and_never_removes_them() {
+        let repo = TempRepo::new("gc-archives");
+        commit_file(&repo, "fog.json", "base\n");
+
+        let editor = write_editor(&repo, "gc-archive-edit", "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-timeout",
+            "--editor",
+            &editor,
+        ]);
+        repo.breeze_ok(&["revert", "--all"]);
+
+        let archive = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main))
+            .join("backups/patches/api-timeout.patch");
+        let sidecar = archive.with_extension("json");
+        assert!(archive.is_file());
+        assert!(sidecar.is_file());
+
+        let output = repo.breeze_ok(&["gc", "--force"]);
+        assert!(output.contains("archived patch kept"), "{output}");
+        assert!(archive.is_file(), "gc must not delete archives");
+        assert!(sidecar.is_file(), "gc must not delete archive metadata");
+    }
 
     #[test]
     fn gc_drops_layers_for_missing_worktrees_and_keeps_the_current_branch() {

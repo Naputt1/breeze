@@ -162,6 +162,38 @@ impl Repo {
         files
     }
 
+    /// Layer directories that apply to this worktree, lowest precedence first.
+    pub fn current_layer_dirs(&self) -> Vec<(Layer, PathBuf)> {
+        let mut dirs = vec![(Layer::Shared, self.layout.shared_dir.clone())];
+        if let Some(branch_id) = &self.branch_id {
+            dirs.push((Layer::Branch, self.layout.branches_dir.join(branch_id)));
+        }
+        dirs.push((Layer::Worktree, self.layout.worktree_dir.clone()));
+        dirs
+    }
+
+    /// Every layer directory in the store, for repository-wide name checks.
+    pub fn all_layer_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.layout.shared_dir.clone()];
+        for base in [&self.layout.branches_dir, &self.layout.worktrees_dir] {
+            let Ok(entries) = fs::read_dir(base) else {
+                continue;
+            };
+            let mut children: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    fs::symlink_metadata(path)
+                        .map(|metadata| metadata.is_dir())
+                        .unwrap_or(false)
+                })
+                .collect();
+            children.sort();
+            dirs.extend(children);
+        }
+        dirs
+    }
+
     /// Load the overrides index.
     pub fn overrides(&self) -> Result<OverridesFile> {
         OverridesFile::load(&self.layout.overrides_file)
@@ -881,6 +913,7 @@ mod tests {
             source: "branches/feature-1234/files/x".to_string(),
             tracked: false,
             base_sha: None,
+            name: None,
             created_at: String::new(),
             updated_at: String::new(),
         };

@@ -1,5 +1,6 @@
 //! `breeze guard` — install, remove and inspect the commit/push guard hooks.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,8 +11,8 @@ use crate::cli::{GuardArgs, GuardCommand, GuardInstallArgs};
 use crate::commands::Ctx;
 use crate::exit::{self, CommandError};
 use crate::store::now_rfc3339;
-use crate::store::overlay::{self, Repo};
-use crate::store::overrides::OverrideMode;
+use crate::store::overlay::{self, Layer, Repo};
+use crate::store::overrides::{OverrideEntry, OverrideMode};
 
 const HOOKS: [&str; 2] = ["pre-commit", "pre-push"];
 const POST_CHECKOUT: &str = "post-checkout";
@@ -127,44 +128,45 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
 fn check_rebase(repo: &Repo) -> Result<i32> {
     let overrides = repo.overrides()?;
     let current = repo.current_target();
-    let mut all_paths: Vec<String> = overrides
+    let mut best: BTreeMap<String, &OverrideEntry> = BTreeMap::new();
+    for entry in overrides
         .overrides
         .iter()
         .filter(|entry| entry.mode == OverrideMode::Patch)
-        .map(|entry| entry.path.clone())
-        .collect();
-    all_paths.sort();
-    all_paths.dedup();
+    {
+        if !overlay::entry_applies(entry, &current) {
+            continue;
+        }
+        match best.entry(entry.path.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if Layer::from_name(&entry.layer) > Layer::from_name(&slot.get().layer) {
+                    slot.insert(entry);
+                }
+            }
+        }
+    }
 
-    let active: Vec<String> = all_paths
-        .into_iter()
-        .filter(|path| {
-            overlay::best_entry(
-                overrides
-                    .overrides
-                    .iter()
-                    .filter(|entry| entry.mode == OverrideMode::Patch && &entry.path == path),
-                &current,
-            )
-            .is_some()
-        })
-        .collect();
-
-    if active.is_empty() {
+    if best.is_empty() {
         return Ok(exit::SUCCESS);
     }
 
+    let active: Vec<String> = best.values().map(|entry| entry.label()).collect();
     eprintln!(
         "breeze: {} tracked patch overlay(s) are active; a rebase can discard or conflict with them",
         active.len()
     );
-    for path in active.iter().take(10) {
-        eprintln!("  {path}");
+    for label in active.iter().take(10) {
+        eprintln!("  {label}");
     }
     if active.len() > 10 {
         eprintln!("  ... and {} more", active.len() - 10);
     }
-    eprintln!("run `breeze revert --all` and retry the rebase");
+    eprintln!(
+        "run `breeze revert --all` (patches are archived; restore later with `breeze restore <name>`), then retry the rebase"
+    );
     Ok(exit::GUARD_BLOCKED)
 }
 
@@ -618,6 +620,13 @@ mod tests {
         output
     }
 
+    fn write_stdin(stdin: &mut std::process::ChildStdin, input: &str) {
+        // A hook may exit without consuming its stdin; the resulting broken
+        // pipe is an expected outcome of a blocked pre-push, not a test
+        // failure. Linux surfaces it as an error, macOS as a silent race.
+        let _ = stdin.write_all(input.as_bytes());
+    }
+
     #[test]
     fn pre_commit_blocks_staged_override_paths_and_honours_the_override_env() {
         let repo = TempRepo::new("guard-precommit");
@@ -668,12 +677,7 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        write_stdin(child.stdin.as_mut().unwrap(), &input);
         assert_eq!(child.wait().unwrap().code(), Some(6));
 
         let mut allowed = Command::new(&pre_push)
@@ -682,12 +686,7 @@ mod tests {
             .stdin(Stdio::piped())
             .spawn()
             .unwrap();
-        allowed
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        write_stdin(allowed.stdin.as_mut().unwrap(), &input);
         assert_eq!(allowed.wait().unwrap().code(), Some(0));
     }
 
@@ -1495,6 +1494,32 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&status).unwrap();
         assert_eq!(value["patched"].as_array().unwrap().len(), 1, "{status}");
         assert_eq!(value["patched"][0]["path"], "fog.json");
+    }
+
+    #[test]
+    fn check_rebase_names_active_patches_and_points_at_restore() {
+        let repo = TempRepo::new("guard-check-rebase-names");
+        commit_file(&repo, "fog.json", "base\n");
+        let editor = write_editor(
+            &repo,
+            "guard-rebase-name-edit",
+            "printf 'local\\n' >> \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-timeout",
+            "--layer",
+            "shared",
+            "--editor",
+            &editor,
+        ]);
+
+        let (code, stderr) = repo.breeze_err(&["guard", "check-rebase"]);
+        assert_eq!(code, 6, "{stderr}");
+        assert!(stderr.contains("api-timeout (fog.json)"), "{stderr}");
+        assert!(stderr.contains("breeze restore <name>"), "{stderr}");
     }
 
     #[test]
