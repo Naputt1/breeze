@@ -306,6 +306,11 @@ pub struct GuardInstallArgs {
     /// Also install the opt-in post-checkout hook that runs `breeze sync`.
     #[arg(long)]
     pub with_post_checkout: bool,
+
+    /// Also install the opt-in post-merge and post-rewrite hooks that run
+    /// `breeze sync` after pulls, merges, rebases and amends.
+    #[arg(long)]
+    pub with_pull_hooks: bool,
 }
 
 #[derive(Debug, Args)]

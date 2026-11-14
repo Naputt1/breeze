@@ -83,7 +83,7 @@ Global flags accepted by every command:
 | `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
-| `breeze guard install [--with-post-checkout]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` additionally installs an opt-in hook that runs `breeze sync --all` after checkout and worktree creation. |
+| `breeze guard install [--with-post-checkout] [--with-pull-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` additionally installs an opt-in hook that runs `breeze sync --all` after checkout and worktree creation. `--with-pull-hooks` installs opt-in `post-merge`/`post-rewrite` hooks that run `breeze sync --all` after pulls, merges, rebases and amends. |
 | `breeze guard uninstall` | Remove managed hooks and restore backed-up hooks. |
 | `breeze guard status` | Report installed hooks and backups. |
 | `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. |
@@ -99,6 +99,25 @@ chosen automatically for `sync`, and recorded explicitly for `link`/`edit`.
 `breeze share <PATH>` moves a branch or worktree link or patch to `shared`;
 a shared patch applies to every branch and worktree on the next
 `breeze sync --all`.
+
+### Guard hooks
+
+`breeze guard install` manages `pre-commit` and `pre-push` hooks that block
+commits and pushes containing local-only paths. Two hook families are opt-in:
+
+- `--with-post-checkout` installs `post-checkout`, which runs
+  `breeze sync --all` after a checkout or new worktree.
+- `--with-pull-hooks` installs `post-merge` and `post-rewrite`, which run
+  `breeze sync --all` after `git pull`/`git merge` and after `git rebase` or
+  `git commit --amend`.
+
+The opt-in hooks are best effort. They do nothing unless `breeze` is on
+`PATH` and the repository is initialized. They suppress sync output and
+always exit `0`; when a patch cannot be applied they print
+`breeze: patch sync needs attention; run breeze doctor` to stderr so the pull
+or rewrite still completes. Existing hooks with the same names are backed up
+as `<hook>.breeze-backup` and chained. Breeze refuses to install when
+`core.hooksPath` points somewhere else.
 
 ## Exit codes
 
@@ -157,8 +176,10 @@ An `exclude` block in `.git/info/exclude` keeps overlay paths out of
   followed.
 - The guard hooks block commits and pushes that include overridden paths,
   unless `BREEZE_ALLOW_COMMIT=1` is set. They chain to pre-existing hooks.
-- The post-checkout hook is opt-in, runs `breeze sync --all` best-effort, and
-  always exits `0`; it never fails a checkout.
+- The post-checkout, post-merge and post-rewrite hooks are opt-in. They run
+  `breeze sync --all` best-effort and always exit `0`; a failing or conflicting
+  sync only prints a warning, so checkouts, pulls, rebases and amends never
+  fail because of Breeze.
 - `gc` never touches the current branch layer or files backing live overrides
   unless `--force` is given.
 - `promote` is the only command that turns local overlay content into tracked
