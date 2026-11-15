@@ -20,9 +20,22 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     let worktree_path = repo.info.root.join(&relative);
 
     require_editable(&repo, &relative, &worktree_path)?;
+    let filter_mode = crate::store::filters::enabled(&repo.info.root);
 
     let layer = match args.layer.as_deref() {
-        Some(value) => Layer::parse(Some(value))?,
+        Some(value) => {
+            let layer = Layer::parse(Some(value))?;
+            if filter_mode && layer != Layer::Shared {
+                return Err(CommandError::new(
+                    exit::UNSAFE_REFUSED,
+                    "editing the branch or worktree layer is not supported in filter mode yet; \
+                     use the shared layer or run `breeze filter disable` first",
+                )
+                .into());
+            }
+            layer
+        }
+        None if filter_mode => Layer::Shared,
         None => Layer::Branch,
     };
     // Validate the layer early: the branch layer needs a checked-out branch.
@@ -45,9 +58,28 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     let editor = resolve_editor(args)?;
     run_editor(&repo.info.root, &editor, &worktree_path)?;
 
-    let diff = patches::generate_diff(&repo.info.root, &relative)?;
+    let contents = fs::read(&worktree_path).map_err(|_| {
+        CommandError::new(
+            exit::GENERAL,
+            format!("the editor removed `{relative}`; restore it or use `breeze revert`"),
+        )
+    })?;
 
-    if diff.trim().is_empty() {
+    // Filter mode cannot ask Git for the diff: the clean filter strips the
+    // patch. Build it from the base blob and the edited file instead.
+    let (diff, base_contents) = if filter_mode {
+        let base_contents = patches::blob_content(&repo.info.root, &base_blob)?;
+        let diff = patches::generate_diff_from_contents(&relative, &base_contents, &contents)?;
+        (diff, Some(base_contents))
+    } else {
+        (patches::generate_diff(&repo.info.root, &relative)?, None)
+    };
+
+    let unchanged = match &base_contents {
+        Some(base) => contents == *base,
+        None => diff.trim().is_empty(),
+    };
+    if unchanged {
         return undo(&repo, &mut overrides, &relative, ctx);
     }
 
@@ -55,12 +87,7 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     warn_other_layers(&overrides, &relative, layer);
 
     let now = now_rfc3339();
-    let applied_hash = patches::file_hash(&worktree_path).ok_or_else(|| {
-        CommandError::new(
-            exit::GENERAL,
-            format!("the editor removed `{relative}`; restore it or use `breeze revert`"),
-        )
-    })?;
+    let applied_hash = patches::hash_bytes(&contents);
     let created_at = patches::read_metadata(&files.metadata)
         .map(|metadata| metadata.created_at)
         .unwrap_or_else(|_| now.clone());
@@ -82,6 +109,9 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
 
     let base_display = patches::short(&base_blob).to_string();
     repo.write_store_file(&files.patch, diff.as_bytes())?;
+    if filter_mode {
+        repo.write_store_file(&files.content, &contents)?;
+    }
     patches::write_metadata(
         &files.metadata,
         &PatchMetadata {
@@ -108,6 +138,12 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         updated_at: now,
     });
     repo.save_overrides(&overrides)?;
+
+    if filter_mode {
+        crate::store::filters::sync_attributes(&repo, &overrides)?;
+        // Force one checkout so smudge materialises the merged file.
+        crate::store::filters::checkout(&repo.info.root, &relative)?;
+    }
     repo.log_event("edit", &relative)?;
 
     if !ctx.quiet {
@@ -117,7 +153,14 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         }
         println!("patch:  {}", files.patch.display());
         println!("base:   {base_display}");
-        println!("file:   {} (modified, not staged)", worktree_path.display());
+        if filter_mode {
+            println!(
+                "file:   {} (filter mode, merged by git)",
+                worktree_path.display()
+            );
+        } else {
+            println!("file:   {} (modified, not staged)", worktree_path.display());
+        }
     }
 
     Ok(exit::SUCCESS)
@@ -222,6 +265,11 @@ fn undo(
 ) -> Result<i32> {
     let removed = remove_patch_entries(repo, overrides, relative)?;
     repo.save_overrides(overrides)?;
+
+    if crate::store::filters::enabled(&repo.info.root) {
+        crate::store::filters::sync_attributes(repo, overrides)?;
+        crate::store::filters::checkout(&repo.info.root, relative)?;
+    }
     repo.log_event("edit-undo", relative)?;
 
     if !ctx.quiet {

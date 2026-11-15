@@ -118,6 +118,9 @@ pub enum Command {
     /// Manage the Git hook guard.
     Guard(GuardArgs),
 
+    /// Manage Git clean/smudge filter mode for patched files.
+    Filter(FilterArgs),
+
     /// Check the store and environment for problems.
     Doctor(DoctorArgs),
 
@@ -355,6 +358,39 @@ pub struct GuardInstallArgs {
     /// post-rewrite, post-applypatch and pre-rebase.
     #[arg(long)]
     pub with_all_hooks: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct FilterArgs {
+    #[command(subcommand)]
+    pub command: FilterCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FilterCommand {
+    /// Enable repo-wide filter mode and register active patches.
+    Enable,
+
+    /// Disable filter mode and restore plain upstream content.
+    Disable,
+
+    /// Show filter mode configuration and deferred patches.
+    Status,
+
+    /// Internal smudge driver: write merged content for PATH to stdout.
+    #[command(hide = true)]
+    Smudge(FilterPathArgs),
+
+    /// Internal clean driver: strip the patch for PATH from stdin.
+    #[command(hide = true)]
+    Clean(FilterPathArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FilterPathArgs {
+    /// Repository-relative path Git is filtering.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Args)]

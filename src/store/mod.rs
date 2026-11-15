@@ -1,6 +1,8 @@
 //! On-disk store: paths, layout, repository metadata and private permissions.
 
+pub mod attributes;
 pub mod exclude;
+pub mod filters;
 pub mod identity;
 pub mod overlay;
 pub mod overrides;

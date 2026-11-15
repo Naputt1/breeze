@@ -75,8 +75,8 @@ Global flags accepted by every command:
 | `breeze status [--json]` | Show repository, worktree, store and overlay status. `--json` includes per-override `path`/`mode`/`layer`/`source`/`name`, stale patches, and a doctor-lite `issues` count. Named patches are shown as `name (path)`. |
 | `breeze link <PATH> [--layer shared\|branch\|worktree] [--all-worktrees]` | Link an untracked file. The default layer is `shared`; `branch` and `worktree` override it locally. `--all-worktrees` is accepted for compatibility; a link already applies to every worktree its layer covers. |
 | `breeze unlink <PATH> [--force]` | Remove link overrides and restore real files. `--force` allows replacing locally modified copies, with a backup. |
-| `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>] [--name <NAME>]` | Edit a tracked file and record the result as a patch (default layer `branch`). `--name` sets or updates a repository-unique patch name (`[a-z0-9][a-z0-9._-]{0,63}`), stored in both the override and patch metadata. |
-| `breeze sync [--all] [--path <PATH>] [--dry-run] [--links-only]` | Repair symlinks and re-apply patches. `--links-only` repairs links without applying tracked patches. Defaults to the current worktree; `--all` covers every worktree. |
+| `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>] [--name <NAME>]` | Edit a tracked file and record the result as a patch (default layer `branch`; filter mode uses only `shared`). `--name` sets or updates a repository-unique patch name (`[a-z0-9][a-z0-9._-]{0,63}`), stored in both the override and patch metadata. |
+| `breeze sync [--all] [--path <PATH>] [--dry-run] [--links-only]` | Repair symlinks and re-apply patches. In filter mode it never writes patches into the worktree; it dry-runs each smudge merge and reports deferred patches. `--links-only` repairs links without applying tracked patches. Defaults to the current worktree; `--all` covers every worktree. |
 | `breeze diff [PATH] [--stat]` | Show changes between overlays and the working tree. Named patches use a `# patch: <name> (<layer>, <path>)` header. |
 | `breeze revert [<PATH>] [--name <NAME>] [--all] [--force]` | Archive one file or every patch to `<layer>/backups/patches/`, then remove the overlay and restore tracked content. |
 | `breeze restore <NAME> [--layer <LAYER>]` | Re-apply an archived patch by name and record it again. Use `--layer` when the name is archived in more than one layer. |
@@ -87,9 +87,12 @@ Global flags accepted by every command:
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
 | `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, and a best-effort `pre-rebase`). |
-| `breeze guard uninstall` | Remove managed hooks and restore backed-up hooks. |
-| `breeze guard status` | Report installed hooks and backups. |
-| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. Named patches are identified as `name (path)`. |
+| `breeze guard uninstall` | Remove managed hooks, restore backed-up hooks, and disable filter mode if it is enabled. |
+| `breeze guard status` | Report installed hooks and backups, plus filter-mode health when enabled. |
+| `breeze filter enable` | Opt this repository into filter mode: write the managed `.git/info/attributes` block and repo-local `filter.breeze` config, capture patched contents, and re-checkout registered paths. Refuses branch or worktree patch records (shared layer only). Safe to rerun. |
+| `breeze filter disable` | Remove the attributes block and filter config and re-checkout registered paths to plain upstream content. Patch records are kept. |
+| `breeze filter status` | Report whether filter mode is enabled, the configured binary and its presence, registered paths, and deferred patches. |
+| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions, missing worktrees, and filter mode (deferred patches, captured content, binary, attributes/config). `--fix` repairs what it safely can. Named patches are identified as `name (path)`. |
 | `breeze gc [--force]` | Remove store data for worktrees that no longer exist, stale fog temp configs, empty directories and orphan patches. Archived patches are reported but never deleted. `--force` also deletes unused store files and keeps only the five newest backups per repository. |
 | `breeze version` | Print the version. |
 | `breeze completions <bash\|zsh\|fish>` | Print a completion script (hidden helper). |
@@ -122,6 +125,11 @@ opt-in; `--with-all-hooks` installs every hook Breeze knows how to use.
 | `--with-post-checkout` | `post-checkout` | Repair links after a branch/worktree checkout; tracked patches are not applied. |
 | `--with-pull-hooks` | `post-merge`, `post-rewrite` | Sync after a merge, pull, rebase or amend. |
 | `--with-all-hooks` | all of the above plus `post-applypatch`, `pre-rebase` | Adds the remaining opt-in hooks; `pre-rebase` is best effort. |
+
+With filter mode enabled, `pre-commit`/`pre-push` stop blocking **patch** paths
+because the clean filter already stages unpatched content; link paths remain
+protected. `pre-rebase` also allows the rebase, since smudge re-merges patches
+after the rewrite.
 
 The sync and guard hooks embed the absolute path of the `breeze` binary that
 installed them and the main worktree root, shell-quoted, and never look up
@@ -159,7 +167,7 @@ sync needs attention; run breeze doctor`.
   runs after a successful `git am`.
 - `pre-rebase` lists active tracked patches as `name (path)` and blocks with
   exit `6`, pointing at `breeze revert --all` and `breeze restore` for later,
-  and allows the rebase when no patches are active.
+  and allows the rebase when no patches are active or filter mode is enabled.
   This is best effort: Git rejects a dirty worktree before running any
   `pre-rebase` hook, so a normal applied patch aborts with Git's own
   "unstaged changes" error before Breeze can speak. Neither the patch content
@@ -180,6 +188,94 @@ never overwrites a backup. Breeze refuses to install when `core.hooksPath`
 points somewhere else. Hooks live in the shared Git directory, so one install
 covers every worktree; installing from a linked worktree is supported and
 embeds the main worktree root. New clones need their own install.
+
+### Filter mode (prototype)
+
+Filter mode replaces the "apply the patch into the working tree and let hooks
+re-apply it" model with Git's own clean/smudge filters. It is repo-wide and
+opt-in:
+
+```sh
+breeze filter enable
+breeze edit fog.json          # defaults to the shared layer in filter mode
+breeze status                 # file shows the merged content; status is clean
+```
+
+`filter enable` writes a managed block to `.git/info/attributes`:
+
+```
+# >>> breeze managed >>>
+fog.json filter=breeze
+# <<< breeze managed <<<
+```
+
+and repo-local config (shared by every worktree):
+
+```
+[filter "breeze"]
+    smudge = /absolute/path/to/breeze filter smudge %f
+    clean  = /absolute/path/to/breeze filter clean %f
+    required = true
+```
+
+The hidden `breeze filter smudge <path>` / `clean <path>` subcommands are the
+filter entry points. They read content on stdin, write to stdout, and **always
+exit 0**; they never prompt. They are registered only for paths that have a
+shared patch. `breeze filter enable` also converts existing shared patch
+records by deriving the full patched content; re-running it is idempotent.
+
+- **smudge** runs whenever Git writes the file (checkout, pull, rebase, reset,
+  stash pop, worktree add). No patch → pass the upstream content through.
+  Otherwise Breeze three-way merges the stored base, stored patched content and
+  upstream content. A clean merge becomes the working-tree file. A conflict
+  writes the upstream content unchanged and marks the patch **deferred**: the
+  tree stays clean and the patch is simply absent until the conflict is
+  resolved with `breeze edit`.
+- **clean** runs whenever Git reads the file (`status`, `diff`, `add`, stash).
+  No patch → pass through. Otherwise it reverses the stored patch out of the
+  working-tree content. Success produces the upstream content (plus any genuine
+  manual edit, which stays dirty); failure passes the content through unchanged.
+  This pairing guarantees that a deferred patch is also clean-passed, so
+  `git status` does not report the patch as a modification.
+
+Lifecycle:
+
+- `breeze edit <path>` captures the full patched content, writes the record,
+  registers the attributes line, then force-checkouts the file so smudge runs.
+- `breeze revert` / `revert --all` / `promote` remove the record and the
+  attributes line, then materialize plain content. `promote` deliberately
+  leaves the patched content on disk and removes the filter registration first,
+  so the usual `git add`/`git commit` records the patched content, not the
+  unpatched upstream blob.
+- `breeze sync` never writes patches into the worktree in filter mode. It
+  dry-runs the smudge merge for each patch against the current index and prints
+  `DEFERRED ...` for conflicts (exit `3`). Links are still repaired.
+- `breeze status` marks deferred patches as `- path [deferred]` in human output
+  and adds them to the JSON `deferred` array. `breeze doctor` reports deferred
+  patches, missing captured content, missing stale context, a missing filter
+  binary, and attributes/config mismatches; `--fix` regenerates missing
+  content, rewrites a moved binary path, and repairs the attributes block.
+- `breeze filter disable` removes the attributes block and config, then
+  re-checkouts registered paths to plain upstream content. Patch records stay in
+  the store, so `breeze sync` can apply them in patch mode later.
+  `breeze guard uninstall` does the same cleanup when filter mode is enabled.
+
+Filter mode is deliberately narrow in this prototype:
+
+- Only the **shared** layer is supported. `breeze edit --layer branch` and
+  `--layer worktree` exit `5` with "not supported in filter mode yet", and
+  `filter enable` refuses a store that already contains non-shared patch
+  records. Link mode is unchanged.
+- `required = true` is intentional. If the configured binary is moved or
+  deleted, Git operations that touch a filtered file fail loudly instead of
+  silently committing unpatched content. `breeze doctor` and
+  `breeze guard status` name the missing path; `breeze doctor --fix` points the
+  config at the running executable.
+- Fresh clones do not inherit `.git/info/attributes` or repo-local config; run
+  `breeze filter enable` again in each clone.
+- With filter mode enabled, the guard hooks stop blocking patch paths (the
+  staged blob is already unpatched) and `pre-rebase` allows rebases; link paths
+  are still protected.
 
 ### Git operation matrix
 
@@ -216,12 +312,34 @@ coverage.
 | `commit`/`push --no-verify` | none | Bypasses `pre-commit`/`pre-push`. | Post hooks still run; do not use it to force local overrides. |
 | GUI/IDE with minimal `PATH` | all installed hooks | Embedded absolute binary still runs. | If the binary moved, the hook warns and no-ops; reinstall. |
 
+#### With filter mode enabled
+
+These rows assume `breeze filter enable` and at least one shared patch. Filter
+mode handles the file inside Git, so the old hook rows above do not apply to
+patched paths.
+
+| Operation | Behavior | Still at risk |
+| --- | --- | --- |
+| `commit` / `push` | `clean` strips the patch; the file is not staged and the committed blob is unpatched. Guard hooks stop blocking patch paths. | A promoted file must have its record and attributes removed first (`breeze promote` does this). |
+| `pull` / `merge`, unrelated change | Patch survives on disk; file stays merged and clean. | A failed or conflicted merge still needs manual resolution. |
+| `pull` / `merge`, same hunk | smudge defers: file becomes upstream content, status stays clean. `sync`/`doctor` report it. | Deferred is silent until `sync`/`doctor`; resolve and re-run `breeze edit`. |
+| `rebase` success | smudge re-merges the patch after the rewrite; `pre-rebase` allows it. | A patch that no longer fits is deferred, not failed. |
+| `rebase` conflict / abort | The rebase checkout may defer; `--abort` restores the branch and smudge reapplies the patch. | Conflicts are still Git's to resolve; no Breeze sync runs after abort. |
+| `checkout -- <file>`, `restore`, `reset --hard` | Git rewrites the file through smudge, so the patch reappears and status stays clean. | A manual tweak that conflicts with the patch can make `clean` pass it through dirty; resolve with `breeze edit` or discard. |
+| `stash` / `stash pop` | The patch is invisible to Git, so a plain stash is a no-op; a real manual tweak round-trips and the patch is reapplied on pop. | Stash conflicts follow Git's usual rules; re-run `breeze edit` after resolving. |
+| `worktree add` | The shared attributes and config make the new worktree materialize patched content through smudge. | Branch/worktree patch layers are not supported in filter mode. |
+| Missing filter binary | `required = true` makes Git operations touching filtered files fail loudly. `doctor` and `guard status` report the missing path. | Recovery needs the binary back (or `doctor --fix` to point at the running one); a fresh clone needs `filter enable` again. |
+
 ### Residual risks and recovery
+
+These apply to patch mode unless a bullet says filter mode.
 
 - Aborted pulls and rebases do not run `post-merge`/`post-rewrite`. Run
   `breeze sync --all` after resolving or aborting.
 - Dirty patched files can make `git pull`, `merge`, `checkout` or `rebase`
   abort before any hook runs. Breeze never hides patch content to avoid this.
+  In filter mode the file is clean instead, so these operations proceed; the
+  trade-off is that a conflict becomes a deferred patch.
 - Branch and worktree checkouts repair links only; tracked patches are not
   reapplied automatically. Run `breeze sync` (or `breeze sync --all`) after
   switching branches when you need the patches back.
@@ -255,6 +373,24 @@ coverage.
   recovery for any uncovered operation is `breeze sync --all`, plus
   `breeze revert --all` before history rewrites and `breeze edit` after
   resolving a patch conflict.
+- Filter mode: `required = true` means a moved or deleted binary aborts Git
+  operations that touch a filtered file, instead of silently committing
+  unpatched content. `breeze doctor` and `breeze guard status` report it;
+  reinstall or run `breeze doctor --fix`.
+- Filter mode: deferred patches are silent until `breeze sync` or
+  `breeze doctor` runs. `breeze status` shows `[deferred]` for the affected
+  paths, but Git itself only sees a clean tree.
+- Filter mode: only shared-layer patches are supported. Branch/worktree layers
+  are refused with exit `5`; run `breeze filter disable` before mixing layers.
+- Filter mode: a manual edit adjacent to a patch can make the reverse merge
+  conflict. `clean` then passes the file through, so the whole file (including
+  the patch content) shows as dirty. Resolve, then re-run `breeze edit` or
+  discard the tweak.
+- Filter mode: a fresh clone has neither the attributes block nor the
+  repo-local config. Run `breeze filter enable` in each clone.
+- Filter mode: `promote` leaves patched content on disk and removes the record
+  and attributes first. Do not run `git commit -a` on that file before the
+  removal completes.
 
 ## Exit codes
 
@@ -285,6 +421,7 @@ repos/<repo_id>/
     files/<path>            link targets in the shared layer
     patches/<path>.patch    shared patches
     patches/<path>.json     patch metadata (name, base blob, applied hash)
+    patches/<path>.content  full patched content (filter mode)
     backups/patches/<name>.patch  archived shared patch
     backups/patches/<name>.json   archive sidecar
     env                     overlay environment (input for `breeze env`/`run`)
@@ -301,7 +438,11 @@ repos/<repo_id>/
 ```
 
 An `exclude` block in `.git/info/exclude` keeps overlay paths out of
-`git status` without modifying tracked `.gitignore` files.
+`git status` without modifying tracked `.gitignore` files. In filter mode a
+managed block in `.git/info/attributes` registers patched paths for the
+`breeze` filter; it is created and removed by `breeze filter enable`/`disable`
+and kept in step with the shared patch records by `edit`, `revert`, `promote`,
+`doctor --fix` and `gc`.
 
 ## Safety notes
 

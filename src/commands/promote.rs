@@ -28,10 +28,47 @@ pub fn run(ctx: &Ctx, args: &PromoteArgs) -> Result<i32> {
         .into());
     }
 
+    let filter_mode = crate::store::filters::enabled(&repo.info.root);
+    let mut diverged_targets = std::collections::BTreeSet::new();
+    if filter_mode {
+        for target in repo.worktree_targets(false) {
+            if target.path == repo.info.root {
+                continue;
+            }
+            let Some(entry) = overlay::best_entry(entries.iter(), &target) else {
+                continue;
+            };
+            if crate::store::filters::manual_diverged(&repo, &target.path, &relative, entry)? {
+                diverged_targets.insert(target.path.clone());
+            }
+        }
+    }
     let archived = crate::commands::archive::archive_entries(&repo, &entries)?;
 
     crate::commands::edit::remove_patch_entries(&repo, &mut overrides, &relative)?;
     repo.save_overrides(&overrides)?;
+    if filter_mode {
+        // The patched file stays on disk in this worktree; only its
+        // registration goes away. Other worktrees fall back to plain content.
+        crate::store::filters::sync_attributes(&repo, &overrides)?;
+        for target in repo.worktree_targets(false) {
+            if target.path == repo.info.root {
+                continue;
+            }
+            let file = target.path.join(&relative);
+            if !file.exists() {
+                continue;
+            }
+            if diverged_targets.contains(&target.path) {
+                eprintln!(
+                    "WARN {} has unrelated edits; left untouched",
+                    file.display()
+                );
+                continue;
+            }
+            crate::store::filters::checkout(&target.path, &relative)?;
+        }
+    }
     repo.log_event("promote", &relative)?;
 
     if !ctx.quiet {

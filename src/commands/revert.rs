@@ -9,7 +9,7 @@ use crate::cli::RevertArgs;
 use crate::commands::{archive, Ctx};
 use crate::exit::{self, CommandError};
 use crate::store::overlay::{self, Repo};
-use crate::store::overrides::OverrideMode;
+use crate::store::overrides::{OverrideEntry, OverrideMode, OverridesFile};
 use crate::store::patches::{self, PatchMetadata};
 
 struct StoredPatch {
@@ -84,6 +84,10 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
             format!("no patch overlay recorded for `{relative}`"),
         )
         .into());
+    }
+
+    if crate::store::filters::enabled(&repo.info.root) {
+        return revert_filter(repo, ctx, relative, force, &patch_entries, &mut overrides);
     }
 
     let mut stored = Vec::with_capacity(patch_entries.len());
@@ -216,6 +220,115 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
         println!(
             "reverted {relative}; removed {} patch override(s)",
             stored.len()
+        );
+        println!("restored: {restored} worktree file(s)");
+        for backup in &backups {
+            println!("backup:   {}", backup.display());
+        }
+        for warning in &warnings {
+            eprintln!("WARN {warning}");
+        }
+    }
+
+    Ok(exit::SUCCESS)
+}
+
+/// Filter-mode revert: drop the record and attributes line, then let Git
+/// check the plain index content back out.
+fn revert_filter(
+    repo: &Repo,
+    ctx: &Ctx,
+    relative: &str,
+    force: bool,
+    patch_entries: &[OverrideEntry],
+    overrides: &mut OverridesFile,
+) -> Result<i32> {
+    use crate::store::filters;
+
+    for entry in patch_entries {
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        let meta_file = patches::metadata_path_for(&patch_file)?;
+        if !Repo::is_regular_store_file(&patch_file) || !Repo::is_regular_store_file(&meta_file) {
+            return Err(overlay::unsafe_refused(format!(
+                "patch files for `{relative}` are missing or are not regular files; run `breeze doctor`"
+            )));
+        }
+    }
+
+    let current = repo.current_target();
+    let current_entry = overlay::best_entry(patch_entries.iter(), &current).ok_or_else(|| {
+        CommandError::new(
+            exit::USAGE,
+            format!("no patch overlay for `{relative}` applies to this worktree"),
+        )
+    })?;
+
+    let mut diverged_targets = std::collections::BTreeSet::new();
+    for target in repo.worktree_targets(false) {
+        if target.path == repo.info.root {
+            continue;
+        }
+        let Some(entry) = overlay::best_entry(patch_entries.iter(), &target) else {
+            continue;
+        };
+        if filters::manual_diverged(repo, &target.path, relative, entry)? {
+            diverged_targets.insert(target.path.clone());
+        }
+    }
+
+    let diverged = filters::manual_diverged(repo, &repo.info.root, relative, current_entry)?;
+    if diverged && !force {
+        return Err(CommandError::new(
+            exit::UNSAFE_REFUSED,
+            format!(
+                "`{}` changed since the patch was applied; rerun with `--force` to back it up and restore the HEAD content",
+                repo.info.root.join(relative).display()
+            ),
+        )
+        .into());
+    }
+
+    let mut backups = Vec::new();
+    if diverged && force {
+        backups.push(repo.backup_file(&repo.info.root.join(relative))?);
+    }
+
+    for entry in patch_entries {
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        patches::remove_patch_files(&patch_file)?;
+        repo.prune_empty_parents(&patch_file);
+    }
+    overrides
+        .overrides
+        .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Patch));
+    repo.save_overrides(overrides)?;
+    filters::sync_attributes(repo, overrides)?;
+
+    let mut restored = 0usize;
+    let mut warnings = Vec::new();
+    for target in repo.worktree_targets(false) {
+        let file = target.path.join(relative);
+        if target.path != repo.info.root && !file.exists() {
+            continue;
+        }
+        if diverged_targets.contains(&target.path) {
+            warnings.push(format!(
+                "{} has unrelated edits; left untouched",
+                file.display()
+            ));
+            continue;
+        }
+        filters::checkout(&target.path, relative)?;
+        println!("restored {relative} in {}", target.path.display());
+        restored += 1;
+    }
+
+    repo.log_event("revert", relative)?;
+
+    if !ctx.quiet {
+        println!(
+            "reverted {relative}; removed {} patch override(s)",
+            patch_entries.len()
         );
         println!("restored: {restored} worktree file(s)");
         for backup in &backups {

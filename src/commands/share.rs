@@ -56,6 +56,15 @@ pub fn run(ctx: &Ctx, args: &ShareArgs) -> Result<i32> {
         return Ok(exit::SUCCESS);
     }
 
+    if crate::store::filters::enabled(&repo.info.root) && chosen.mode == OverrideMode::Patch {
+        return Err(CommandError::new(
+            exit::UNSAFE_REFUSED,
+            "sharing a branch or worktree patch is not supported in filter mode yet; \
+             run `breeze filter disable` first",
+        )
+        .into());
+    }
+
     let now = now_rfc3339();
     let (source, moved_links) = match chosen.mode {
         OverrideMode::Link => (share_link(&repo, &relative, &chosen)?, true),

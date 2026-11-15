@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use crate::cli::{GuardArgs, GuardCommand, GuardInstallArgs};
 use crate::commands::Ctx;
 use crate::exit::{self, CommandError};
+use crate::store::filters;
 use crate::store::now_rfc3339;
 use crate::store::overlay::{self, Layer, Repo};
 use crate::store::overrides::{OverrideEntry, OverrideMode};
@@ -126,6 +127,12 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
 }
 
 fn check_rebase(repo: &Repo) -> Result<i32> {
+    // Filter mode keeps patches out of the worktree's Git state entirely, so a
+    // rebase cannot stage or discard them; smudge re-merges after the rewrite.
+    if filters::enabled(&repo.info.root) {
+        return Ok(exit::SUCCESS);
+    }
+
     let overrides = repo.overrides()?;
     let current = repo.current_target();
     let mut best: BTreeMap<String, &OverrideEntry> = BTreeMap::new();
@@ -210,6 +217,24 @@ fn uninstall(repo: &Repo, ctx: &Ctx) -> Result<i32> {
         }
     }
 
+    if filters::enabled(&repo.info.root) {
+        let paths = filters::disable(repo)?;
+        for target in repo.worktree_targets(false) {
+            for relative in &paths {
+                if target.path.join(relative).is_file() {
+                    filters::checkout(&target.path, relative)?;
+                }
+            }
+        }
+        if !ctx.quiet {
+            println!(
+                "disabled filter mode ({} path{} unregistered)",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" }
+            );
+        }
+    }
+
     Ok(exit::SUCCESS)
 }
 
@@ -246,6 +271,26 @@ fn status(repo: &Repo, ctx: &Ctx) -> Result<i32> {
     if !ctx.quiet {
         println!("hooks: {}", hooks_dir.display());
     }
+
+    if filters::enabled(&repo.info.root) {
+        let paths = filters::registered_paths(repo)?;
+        match filters::configured_binary(&repo.info.root) {
+            Some(binary) if binary.is_file() => println!(
+                "filter mode: enabled ({} path{}, binary {})",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" },
+                binary.display()
+            ),
+            Some(binary) => println!(
+                "filter mode: enabled but binary is MISSING: {} (Git operations on filtered files fail; reinstall breeze or run `breeze doctor --fix`)",
+                binary.display()
+            ),
+            None => println!(
+                "filter mode: enabled but filter.breeze.smudge is not configured (run `breeze filter enable`)"
+            ),
+        }
+    }
+
     Ok(exit::SUCCESS)
 }
 
@@ -308,8 +353,23 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn overridden_function() -> &'static str {
-    r#"overridden() {
+    r#"patch_paths() {
+  awk '/"path": / { p=$0; sub(/.*"path": "/,"",p); sub(/",[ \t]*$/,"",p) } /"mode": "patch"/ { print p }' "$OVERRIDES"
+}
+
+overridden() {
   target="$1"
+  # Filter mode stages patch paths clean (unpatched), so only link overrides
+  # remain local-only.  Patches are safe to commit there.
+  if git config --local --get filter.breeze.smudge >/dev/null 2>&1; then
+    while IFS= read -r candidate; do
+      if [ "$candidate" = "$target" ]; then
+        return 1
+      fi
+    done <<EOF
+$(patch_paths)
+EOF
+  fi
   while IFS= read -r candidate; do
     if [ "$candidate" = "$target" ]; then
       return 0

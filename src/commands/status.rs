@@ -30,6 +30,12 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
 
     let stale = stale_patches(&repo, &patched)?;
     let issues = count_issues(&repo, &linked)?;
+    let deferred = if crate::store::filters::enabled(&repo.info.root) {
+        crate::store::filters::deferred_paths(&repo)?
+    } else {
+        Vec::new()
+    };
+    let deferred_set: BTreeSet<String> = deferred.iter().cloned().collect();
 
     let name = repo_name(&repo.meta.root);
     let store_path = repo.layout.repo_dir.display().to_string();
@@ -46,6 +52,7 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             "linked": linked.iter().map(|entry| view(entry)).collect::<Vec<_>>(),
             "patched": patched.iter().map(|entry| view(entry)).collect::<Vec<_>>(),
             "stale": stale,
+            "deferred": deferred,
             "issues": issues,
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -62,14 +69,17 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         println!("overlays:  {links} link(s), {patches} patch(es)");
 
         if !overrides.overrides.is_empty() {
-            print_group("Linked", "shared", &linked);
-            print_group("Linked", "branch", &linked);
-            print_group("Linked", "worktree", &linked);
-            print_group("Patches", "shared", &patched);
-            print_group("Patches", "branch", &patched);
-            print_group("Patches", "worktree", &patched);
+            print_group("Linked", "shared", &linked, &deferred_set);
+            print_group("Linked", "branch", &linked, &deferred_set);
+            print_group("Linked", "worktree", &linked, &deferred_set);
+            print_group("Patches", "shared", &patched, &deferred_set);
+            print_group("Patches", "branch", &patched, &deferred_set);
+            print_group("Patches", "worktree", &patched, &deferred_set);
         }
 
+        if !deferred.is_empty() {
+            println!("Deferred:            {}", deferred.join(", "));
+        }
         if !stale.is_empty() {
             let labels: Vec<String> = stale
                 .iter()
@@ -102,11 +112,17 @@ fn view(entry: &OverrideEntry) -> Value {
     })
 }
 
-fn print_group(label: &str, layer: &str, entries: &[&OverrideEntry]) {
+fn print_group(label: &str, layer: &str, entries: &[&OverrideEntry], deferred: &BTreeSet<String>) {
     let labels: Vec<String> = entries
         .iter()
         .filter(|entry| entry.layer == layer)
-        .map(|entry| entry.label())
+        .map(|entry| {
+            if deferred.contains(&entry.path) {
+                format!("{} [deferred]", entry.label())
+            } else {
+                entry.label()
+            }
+        })
         .collect();
     if labels.is_empty() {
         return;
@@ -116,6 +132,11 @@ fn print_group(label: &str, layer: &str, entries: &[&OverrideEntry]) {
 
 /// Paths whose recorded patch base no longer matches the blob at `HEAD`.
 fn stale_patches(repo: &Repo, patches_entries: &[&OverrideEntry]) -> Result<Vec<String>> {
+    // Filter mode merges three-way against the current upstream content; a
+    // moved blob is expected and reported as `deferred` when it conflicts.
+    if crate::store::filters::enabled(&repo.info.root) {
+        return Ok(Vec::new());
+    }
     let mut best: BTreeMap<&str, &OverrideEntry> = BTreeMap::new();
     for entry in patches_entries {
         match best.entry(entry.path.as_str()) {
