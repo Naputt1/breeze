@@ -6,6 +6,7 @@ pub mod diff;
 pub mod doctor;
 pub mod edit;
 pub mod env;
+pub mod filter;
 pub mod fog;
 pub mod gc;
 pub mod guard;
@@ -58,6 +59,7 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Run(args) => run::run(&ctx, &args),
         Command::Fog(args) => fog::run(&ctx, &args),
         Command::Guard(args) => guard::run(&ctx, &args),
+        Command::Filter(args) => filter::run(&ctx, &args),
         Command::Doctor(args) => doctor::run(&ctx, &args),
         Command::Gc(args) => gc::run(&ctx, &args),
         Command::Version => {

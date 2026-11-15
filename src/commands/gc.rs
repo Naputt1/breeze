@@ -10,6 +10,7 @@ use crate::cli::GcArgs;
 use crate::commands::Ctx;
 use crate::exit;
 use crate::fog::temp;
+use crate::store::filters;
 use crate::store::overlay::{self, Repo};
 use crate::store::overrides::{OverrideMode, OverridesFile};
 use crate::store::patches;
@@ -122,6 +123,9 @@ pub fn run(ctx: &Ctx, args: &GcArgs) -> Result<i32> {
 
     if changed {
         repo.save_overrides(&overrides)?;
+        if filters::enabled(&repo.info.root) {
+            filters::sync_attributes(&repo, &overrides)?;
+        }
     }
     repo.log_event("gc", &format!("{} action(s)", report.len()))?;
 
@@ -249,11 +253,17 @@ fn clean_orphan_patches(
             let source = overlay::relative_string(&repo.layout.repo_dir, &file);
 
             if !is_patch {
-                // Metadata without its patch is reported, never removed.
-                if file.extension().and_then(|ext| ext.to_str()) == Some("json")
-                    && !file.with_extension("patch").exists()
-                {
+                let extension = file.extension().and_then(|ext| ext.to_str());
+                if extension == Some("json") && !file.with_extension("patch").exists() {
                     report.push(format!("orphan patch metadata kept: {source}"));
+                } else if extension == Some("content") && !file.with_extension("patch").exists() {
+                    // Captured patched contents are derived data; without the
+                    // patch they can never be used again.
+                    fs::remove_file(&file)
+                        .with_context(|| format!("failed to remove {}", file.display()))?;
+                    repo.prune_empty_parents(&file);
+                    report.push(format!("removed orphan patch contents: {source}"));
+                    changed = true;
                 }
                 continue;
             }

@@ -61,19 +61,49 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
     let mut failures = 0usize;
     let mut conflicts = 0usize;
     let mut changes = 0usize;
+    let filter_mode = crate::store::filters::enabled(&repo.info.root);
 
     if !args.links_only {
-        for path in &entry_paths(&patches) {
-            let path_entries: Vec<&OverrideEntry> =
-                patches.iter().filter(|entry| &entry.path == path).collect();
-            for target in &targets {
-                match sync_patch(&repo, path, &path_entries, target, args.dry_run) {
-                    Ok(PatchChange::Unchanged) => {}
-                    Ok(PatchChange::Applied) => changes += 1,
-                    Ok(PatchChange::Conflict) => conflicts += 1,
-                    Err(err) => {
-                        eprintln!("error: failed to sync `{path}`: {err:#}");
-                        failures += 1;
+        if filter_mode {
+            // Filters do the applying. Sync only dry-runs the smudge merge so
+            // deferred patches are visible after a pull or merge.
+            for path in &entry_paths(&patches) {
+                let path_entries: Vec<&OverrideEntry> =
+                    patches.iter().filter(|entry| &entry.path == path).collect();
+                for target in &targets {
+                    let Some(entry) = overlay::best_entry(path_entries.iter().copied(), target)
+                    else {
+                        continue;
+                    };
+                    match crate::store::filters::forward_merge(&repo, &target.path, path, entry) {
+                        crate::store::filters::MergeOutcome::Clean => {}
+                        crate::store::filters::MergeOutcome::Deferred => {
+                            println!(
+                                "DEFERRED {path} in {} (upstream content conflicts; patch not applied)",
+                                target.path.display()
+                            );
+                            conflicts += 1;
+                        }
+                        crate::store::filters::MergeOutcome::Unavailable => {
+                            eprintln!("error: patch data for `{path}` is unavailable; run `breeze doctor`");
+                            failures += 1;
+                        }
+                    }
+                }
+            }
+        } else {
+            for path in &entry_paths(&patches) {
+                let path_entries: Vec<&OverrideEntry> =
+                    patches.iter().filter(|entry| &entry.path == path).collect();
+                for target in &targets {
+                    match sync_patch(&repo, path, &path_entries, target, args.dry_run) {
+                        Ok(PatchChange::Unchanged) => {}
+                        Ok(PatchChange::Applied) => changes += 1,
+                        Ok(PatchChange::Conflict) => conflicts += 1,
+                        Err(err) => {
+                            eprintln!("error: failed to sync `{path}`: {err:#}");
+                            failures += 1;
+                        }
                     }
                 }
             }

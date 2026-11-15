@@ -131,6 +131,9 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
     }
 
     problems += check_patches(&repo, &overrides)?;
+    let (filter_problems, filter_fixed) = check_filter_mode(&repo, &overrides, args.fix)?;
+    problems += filter_problems;
+    fixed += filter_fixed;
 
     let known: HashSet<String> = overrides
         .overrides
@@ -248,7 +251,10 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
         let object_ok = patches::blob_exists(&repo.info.root, &metadata.base_blob).unwrap_or(false);
         let head_blob = patches::head_blob(&repo.info.root, path)?;
         let head_matches = head_blob.as_deref() == Some(metadata.base_blob.as_str());
-        if !object_ok || !head_matches {
+        // Filter mode merges the patch three-way, so a moved upstream blob is
+        // expected; deferred patches are reported separately.
+        let filter_mode = crate::store::filters::enabled(&repo.info.root);
+        if !object_ok || (!filter_mode && !head_matches) {
             let base = patches::short(&metadata.base_blob);
             let current = head_blob
                 .as_deref()
@@ -262,6 +268,194 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
     }
 
     Ok(problems)
+}
+
+/// Check filter mode: driver config, attributes block and captured contents.
+fn check_filter_mode(repo: &Repo, overrides: &OverridesFile, fix: bool) -> Result<(usize, usize)> {
+    use crate::store::{attributes, filters};
+
+    let enabled = filters::enabled(&repo.info.root);
+    let registered = filters::registered_paths(repo)?;
+    let expected = filters::expected_paths(overrides);
+    let mut problems = 0usize;
+    let mut fixed = 0usize;
+    let mut path_problems = 0usize;
+
+    if !enabled {
+        if !registered.is_empty() {
+            if fix {
+                attributes::write_paths(&filters::attributes_file(repo), &[])?;
+                println!("FIXED removed filter attributes block (filter mode is off)");
+                fixed += 1;
+            } else {
+                println!(
+                    "WARN filter attributes block is present but filter.breeze is not configured; run `breeze filter disable` or `breeze doctor --fix`"
+                );
+                problems += 1;
+            }
+        }
+        return Ok((problems, fixed));
+    }
+
+    let mut config_ok = true;
+    match filters::configured_binary(&repo.info.root) {
+        Some(binary) if binary.is_file() => {}
+        Some(binary) => {
+            config_ok = false;
+            if fix {
+                filters::enable_config(repo)?;
+                println!(
+                    "FIXED filter binary was missing ({}); rewrote config to the running executable",
+                    binary.display()
+                );
+                fixed += 1;
+            } else {
+                println!(
+                    "BROKEN filter binary is missing: {} (Git operations fail while required=true); reinstall breeze or run `breeze doctor --fix`",
+                    binary.display()
+                );
+                problems += 1;
+            }
+        }
+        None => {
+            config_ok = false;
+            if fix {
+                filters::enable_config(repo)?;
+                println!("FIXED filter driver config was incomplete");
+                fixed += 1;
+            } else {
+                println!("BROKEN filter driver has no smudge command; run `breeze filter enable`");
+                problems += 1;
+            }
+        }
+    }
+
+    let required = filters::required(&repo.info.root);
+    if !required {
+        if fix {
+            filters::enable_config(repo)?;
+            println!("FIXED filter.breeze.required was not true");
+            fixed += 1;
+        } else {
+            println!(
+                "WARN filter.breeze.required is not true; a missing binary would silently skip patches"
+            );
+            problems += 1;
+        }
+    }
+
+    let missing: Vec<String> = expected
+        .iter()
+        .filter(|path| !registered.contains(path))
+        .cloned()
+        .collect();
+    let stale: Vec<String> = registered
+        .iter()
+        .filter(|path| !expected.contains(path))
+        .cloned()
+        .collect();
+    if !missing.is_empty() || !stale.is_empty() {
+        let detail = format!(
+            "missing: {}; stale: {}",
+            missing.join(", "),
+            stale.join(", ")
+        );
+        if fix {
+            filters::sync_attributes(repo, overrides)?;
+            println!("FIXED filter attributes block is out of sync ({detail})");
+            fixed += 1;
+        } else {
+            println!(
+                "WARN filter attributes block is out of sync ({detail}); run `breeze doctor --fix`"
+            );
+            problems += 1;
+        }
+    }
+
+    for entry in overrides
+        .overrides
+        .iter()
+        .filter(|entry| entry.mode == OverrideMode::Patch && entry.layer != Layer::Shared.name())
+    {
+        println!(
+            "BROKEN {} patch is on the {} layer; filter mode only supports shared patches (run `breeze filter disable` first)",
+            entry.path, entry.layer
+        );
+        problems += 1;
+        path_problems += 1;
+    }
+
+    let problems_before_paths = problems;
+    for path in &expected {
+        let Some(entry) = filters::shared_entry(overrides, path) else {
+            continue;
+        };
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        let Ok(content_path) = patches::content_path_for(&patch_file) else {
+            println!(
+                "BROKEN {path} patch file name is not a .patch path: {}",
+                patch_file.display()
+            );
+            problems += 1;
+            continue;
+        };
+        if !Repo::is_regular_store_file(&content_path) {
+            if fix {
+                match filters::ensure_content(repo, path) {
+                    Ok(()) => {
+                        println!("FIXED {path} captured patched contents");
+                        fixed += 1;
+                    }
+                    Err(err) => {
+                        println!("BROKEN {path} could not capture patched contents: {err:#}");
+                        problems += 1;
+                    }
+                }
+            } else {
+                println!(
+                    "BROKEN {path} captured patched contents are missing: {}; re-run `breeze edit {path}`",
+                    content_path.display()
+                );
+                problems += 1;
+            }
+            continue;
+        }
+
+        match filters::forward_merge(repo, &repo.info.root, path, entry) {
+            filters::MergeOutcome::Deferred => {
+                println!(
+                    "DEFERRED {path} upstream content conflicts with the patch; resolve it and re-run `breeze edit {path}`"
+                );
+                problems += 1;
+            }
+            filters::MergeOutcome::Unavailable => {
+                println!("BROKEN {path} cannot dry-run the smudge merge; patch data is incomplete");
+                problems += 1;
+            }
+            filters::MergeOutcome::Clean => {
+                let Ok(Some(index)) = patches::index_content(&repo.info.root, path) else {
+                    continue;
+                };
+                let Ok(content) = fs::read(repo.info.root.join(path)) else {
+                    continue;
+                };
+                if content != index && filters::reverse(repo, entry, &content).is_none() {
+                    println!(
+                        "WARN {path} clean would not strip the patch from the working tree (stale context); re-run `breeze edit {path}`"
+                    );
+                    problems += 1;
+                }
+            }
+        }
+    }
+
+    path_problems += problems - problems_before_paths;
+
+    if config_ok && missing.is_empty() && stale.is_empty() && path_problems == 0 {
+        println!("OK filter mode: {} path(s)", expected.len());
+    }
+
+    Ok((problems, fixed))
 }
 
 #[cfg(unix)]

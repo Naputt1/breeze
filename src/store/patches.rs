@@ -45,11 +45,14 @@ pub struct ArchivedPatch {
     pub archived_at: String,
 }
 
-/// Address of a patch and its metadata inside one layer.
+/// Address of a patch, its metadata and its full patched contents in a layer.
 #[derive(Debug, Clone)]
 pub struct PatchFiles {
     pub patch: PathBuf,
     pub metadata: PathBuf,
+    /// Full file contents after applying the patch, captured at edit time.
+    /// Filter mode needs it for clean/smudge merges.
+    pub content: PathBuf,
 }
 
 /// Compute the patch and metadata paths for a path inside a layer directory.
@@ -58,7 +61,20 @@ pub fn patch_files(layer_dir: &Path, relative: &str) -> PatchFiles {
     PatchFiles {
         patch: patches_dir.join(format!("{relative}.patch")),
         metadata: patches_dir.join(format!("{relative}.json")),
+        content: patches_dir.join(format!("{relative}.content")),
     }
+}
+
+/// Full patched-content path that sits next to a stored patch file.
+pub fn content_path_for(patch_file: &Path) -> Result<PathBuf> {
+    let text = patch_file.to_string_lossy();
+    let stem = text.strip_suffix(".patch").ok_or_else(|| {
+        anyhow::anyhow!(
+            "patch file name does not end in .patch: {}",
+            patch_file.display()
+        )
+    })?;
+    Ok(PathBuf::from(format!("{stem}.content")))
 }
 
 /// Metadata path that sits next to a stored patch file.
@@ -94,6 +110,7 @@ pub fn archive_files(layer_dir: &Path, name: &str) -> PatchFiles {
     PatchFiles {
         patch: dir.join(format!("{name}.patch")),
         metadata: dir.join(format!("{name}.json")),
+        content: dir.join(format!("{name}.content")),
     }
 }
 
@@ -174,11 +191,15 @@ pub fn fallback_name(relative: &str, patch: &[u8]) -> String {
     format!("{base}-{}", &hash[..8])
 }
 
-/// Remove a stored patch and its metadata, ignoring absence.
+/// Remove a stored patch, its metadata and its captured contents, ignoring
+/// absence.
 pub fn remove_patch_files(patch_file: &Path) -> Result<()> {
     remove_if_exists(patch_file)?;
     if let Ok(metadata) = metadata_path_for(patch_file) {
         remove_if_exists(&metadata)?;
+    }
+    if let Ok(content) = content_path_for(patch_file) {
+        remove_if_exists(&content)?;
     }
     Ok(())
 }
@@ -281,6 +302,154 @@ pub fn generate_diff(root: &Path, relative: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Contents of `relative` in the index, when it has an entry there.
+///
+/// This is the "upstream" side filter mode merges a patch onto. Reading the
+/// index does not run clean/smudge filters.
+pub fn index_content(root: &Path, relative: &str) -> Result<Option<Vec<u8>>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &format!(":{relative}")])
+        .output()
+        .context("failed to run git show")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(output.stdout))
+}
+
+/// Generate a stored patch from two in-memory versions of a file.
+///
+/// Filter mode cannot use `git diff HEAD -- <path>` because the clean filter
+/// strips the patch before Git sees the working tree. Building the diff from
+/// the base blob and the captured patched contents keeps it honest.
+pub fn generate_diff_from_contents(relative: &str, base: &[u8], patched: &[u8]) -> Result<String> {
+    if base == patched {
+        return Ok(String::new());
+    }
+
+    let dir = temp_dir("diff")?;
+    let result = (|| {
+        let left = dir.join("a").join(relative);
+        let right = dir.join("b").join(relative);
+        for path in [&left, &right] {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(&left, base)?;
+        fs::write(&right, patched)?;
+
+        let left_arg = format!("a/{relative}");
+        let right_arg = format!("b/{relative}");
+        let output = Command::new("git")
+            .current_dir(&dir)
+            .args([
+                "diff",
+                "--no-index",
+                "--no-color",
+                "--no-prefix",
+                "--binary",
+                "--",
+                &left_arg,
+                &right_arg,
+            ])
+            .output()
+            .context("failed to run git diff --no-index")?;
+
+        // `--no-index` exits 1 when the files differ, which is the normal case.
+        if output.status.code() != Some(0) && output.status.code() != Some(1) {
+            bail!(
+                "git diff --no-index failed for {relative}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    })();
+
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// Reconstruct the full patched contents `P` for an existing patch.
+///
+/// Used by `filter enable` for patches recorded before filter mode existed.
+/// A private index is seeded with the base blob, the stored diff is applied to
+/// that index only, and the resulting blob is read back.
+pub fn derive_patched_content(
+    root: &Path,
+    relative: &str,
+    base_blob: &str,
+    patch_file: &Path,
+) -> Result<Vec<u8>> {
+    let dir = temp_dir("derive")?;
+    let index = dir.join("index");
+    let result = (|| {
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(root)
+            .env("GIT_INDEX_FILE", &index)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{base_blob},{relative}"),
+            ]);
+        let output = command.output().context("failed to run git update-index")?;
+        if !output.status.success() {
+            bail!(
+                "failed to seed index for {relative}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["apply", "--cached", "--whitespace=nowarn"])
+            .arg(patch_file)
+            .output()
+            .context("failed to run git apply --cached")?;
+        if !output.status.success() {
+            bail!(
+                "failed to apply stored patch for {relative}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["show", &format!(":{relative}")])
+            .output()
+            .context("failed to read patched blob")?;
+        if !output.status.success() {
+            bail!(
+                "failed to read patched contents for {relative}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(output.stdout)
+    })();
+
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+fn temp_dir(label: &str) -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("breeze-{label}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Outcome of applying a stored patch in one worktree.
