@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{read_json, write_json};
+use crate::store::{read_json, write_json, write_private_file};
 
 /// Contents of `<layer>/patches/<relative-path>.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,8 +25,24 @@ pub struct PatchMetadata {
     pub base_blob: String,
     /// `sha256:` hash of the file content after the last successful sync.
     pub applied_hash: String,
+    /// Optional human-readable patch name, kept in sync with the override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Sidecar metadata for an archived patch under `<layer>/backups/patches/`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedPatch {
+    pub name: String,
+    /// Repository-relative path the patch applies to.
+    pub path: String,
+    /// Layer the patch was archived from.
+    pub layer: String,
+    pub base_sha: String,
+    pub base_blob: String,
+    pub archived_at: String,
 }
 
 /// Address of a patch and its metadata inside one layer.
@@ -65,6 +81,97 @@ pub fn read_metadata(path: &Path) -> Result<PatchMetadata> {
 /// Write patch metadata with private permissions.
 pub fn write_metadata(path: &Path, metadata: &PatchMetadata) -> Result<()> {
     write_json(path, metadata)
+}
+
+/// Directory holding archived patches for a layer.
+pub fn archive_dir(layer_dir: &Path) -> PathBuf {
+    layer_dir.join("backups").join("patches")
+}
+
+/// Address of an archived patch and its sidecar inside one layer.
+pub fn archive_files(layer_dir: &Path, name: &str) -> PatchFiles {
+    let dir = archive_dir(layer_dir);
+    PatchFiles {
+        patch: dir.join(format!("{name}.patch")),
+        metadata: dir.join(format!("{name}.json")),
+    }
+}
+
+/// Read an archived patch sidecar.
+pub fn read_archived(metadata: &Path) -> Result<ArchivedPatch> {
+    read_json(metadata)
+}
+
+/// Write an archived patch and its sidecar with private permissions.
+pub fn write_archived(
+    layer_dir: &Path,
+    record: &ArchivedPatch,
+    patch: &[u8],
+) -> Result<PatchFiles> {
+    let files = archive_files(layer_dir, &record.name);
+    write_private_file(&files.patch, patch)?;
+    write_json(&files.metadata, record)?;
+    Ok(files)
+}
+
+/// Sidecars of every archived patch in one layer, skipping unreadable files.
+pub fn list_archived(layer_dir: &Path) -> Vec<ArchivedPatch> {
+    let dir = archive_dir(layer_dir);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(record) = read_archived(&path) {
+            records.push(record);
+        }
+    }
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    records
+}
+
+/// Validate a patch name: `[a-z0-9][a-z0-9._-]{0,63}`.
+pub fn validate_name(name: &str) -> Result<()> {
+    let valid = name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .map(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+            .unwrap_or(false)
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        });
+
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::exit::CommandError::new(
+            crate::exit::USAGE,
+            format!(
+                "invalid patch name `{name}`; use lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit (at most 64 characters)"
+            ),
+        )
+        .into())
+    }
+}
+
+/// Name used when a patch is archived without one: the sanitized path plus
+/// the first eight hex characters of the patch content hash.
+pub fn fallback_name(relative: &str, patch: &[u8]) -> String {
+    let mut base = crate::store::identity::sanitize(relative);
+    base.truncate(55);
+    while base.ends_with('-') {
+        base.pop();
+    }
+    if base.is_empty() {
+        base.push_str("patch");
+    }
+    let hash = sha256_hex(patch);
+    format!("{base}-{}", &hash[..8])
 }
 
 /// Remove a stored patch and its metadata, ignoring absence.

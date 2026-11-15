@@ -269,6 +269,10 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
     let patch_files = patches::patch_files(&repo.layout.shared_dir, relative);
     let shared_patch = patch_files.patch;
     let shared_meta = patch_files.metadata;
+    let mut metadata: patches::PatchMetadata = serde_json::from_slice(&meta_bytes)
+        .with_context(|| format!("failed to parse patch metadata for `{relative}`"))?;
+    metadata.name = entry.name.clone();
+
     if fs::symlink_metadata(&shared_patch).is_ok() {
         if !Repo::is_regular_store_file(&shared_patch) {
             return Err(overlay::unsafe_refused(format!(
@@ -288,7 +292,7 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
     }
 
     repo.write_store_file(&shared_patch, &patch_bytes)?;
-    repo.write_store_file(&shared_meta, &meta_bytes)?;
+    patches::write_metadata(&shared_meta, &metadata)?;
     fs::remove_file(&old_patch)
         .with_context(|| format!("failed to remove {}", old_patch.display()))?;
     if overlay::exists(&old_meta) {
@@ -297,10 +301,81 @@ fn share_patch(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<Str
     }
     repo.prune_empty_parents(&old_patch);
 
+    if let Err(err) = move_archive(repo, relative, entry) {
+        eprintln!(
+            "warning: could not move the archived copy of `{relative}` to the shared layer: {err:#}"
+        );
+    }
+
     Ok(overlay::relative_string(
         &repo.layout.repo_dir,
         &shared_patch,
     ))
+}
+
+/// Move a matching archive from the old layer to `shared/backups/patches/`.
+fn move_archive(repo: &Repo, relative: &str, entry: &OverrideEntry) -> Result<()> {
+    let Some(layer) = Layer::from_name(&entry.layer) else {
+        return Ok(());
+    };
+    if layer == Layer::Shared {
+        return Ok(());
+    }
+    let old_layer_dir = repo.layer_dir(layer)?;
+    let Some(record) = patches::list_archived(&old_layer_dir)
+        .into_iter()
+        .find(|record| {
+            record.path == relative
+                && entry
+                    .name
+                    .as_ref()
+                    .map(|name| &record.name == name)
+                    .unwrap_or(true)
+        })
+    else {
+        return Ok(());
+    };
+
+    let old_files = patches::archive_files(&old_layer_dir, &record.name);
+    let new_files = patches::archive_files(&repo.layout.shared_dir, &record.name);
+    if fs::symlink_metadata(&new_files.patch).is_ok() {
+        let existing = fs::read(&new_files.patch)
+            .with_context(|| format!("failed to read {}", new_files.patch.display()))?;
+        let source = fs::read(&old_files.patch)
+            .with_context(|| format!("failed to read {}", old_files.patch.display()))?;
+        if existing != source {
+            eprintln!(
+                "warning: archived patch `{}` already exists in the shared layer with different content; left {} in place",
+                record.name,
+                old_files.patch.display()
+            );
+            return Ok(());
+        }
+        fs::remove_file(&old_files.patch).ok();
+        fs::remove_file(&old_files.metadata).ok();
+        repo.prune_empty_parents(&old_files.patch);
+        return Ok(());
+    }
+
+    if let Some(parent) = new_files.patch.parent() {
+        crate::store::create_private_dir(parent)?;
+    }
+    fs::rename(&old_files.patch, &new_files.patch).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            old_files.patch.display(),
+            new_files.patch.display()
+        )
+    })?;
+    fs::rename(&old_files.metadata, &new_files.metadata).with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            old_files.metadata.display(),
+            new_files.metadata.display()
+        )
+    })?;
+    repo.prune_empty_parents(&old_files.patch);
+    Ok(())
 }
 
 #[cfg(test)]

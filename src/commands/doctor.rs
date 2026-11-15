@@ -196,25 +196,29 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
 
     let mut problems = 0usize;
     for (path, entries) in &grouped {
+        let best = entries
+            .iter()
+            .max_by_key(|entry| Layer::from_name(&entry.layer));
+        let label = best
+            .map(|entry| entry.label())
+            .unwrap_or_else(|| path.clone());
+
         if entries.len() > 1 {
             let layers: Vec<&str> = entries.iter().map(|entry| entry.layer.as_str()).collect();
             println!(
-                "WARN {path} has duplicate patch overrides in layers {}; keep one layer or run `breeze promote {path}`",
+                "WARN {label} has duplicate patch overrides in layers {}; keep one layer or run `breeze promote {path}`",
                 layers.join(", ")
             );
             problems += 1;
         }
 
-        let Some(entry) = entries
-            .iter()
-            .max_by_key(|entry| Layer::from_name(&entry.layer))
-        else {
+        let Some(entry) = best else {
             continue;
         };
         let patch_file = repo.layout.repo_dir.join(&entry.source);
         if !Repo::is_regular_store_file(&patch_file) {
             println!(
-                "BROKEN {path} patch file is missing or is not a regular file: {}",
+                "BROKEN {label} patch file is missing or is not a regular file: {}",
                 patch_file.display()
             );
             problems += 1;
@@ -224,7 +228,7 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
         let meta_path = match patches::metadata_path_for(&patch_file) {
             Ok(path) => path,
             Err(err) => {
-                println!("BROKEN {path} patch metadata path is invalid: {err}");
+                println!("BROKEN {label} patch metadata path is invalid: {err}");
                 problems += 1;
                 continue;
             }
@@ -233,7 +237,7 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
             Ok(metadata) => metadata,
             Err(_) => {
                 println!(
-                    "BROKEN {path} patch metadata is missing or invalid: {}",
+                    "BROKEN {label} patch metadata is missing or invalid: {}",
                     meta_path.display()
                 );
                 problems += 1;
@@ -251,7 +255,7 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
                 .map(patches::short)
                 .unwrap_or("(missing at HEAD)");
             println!(
-                "STALE {path} patch base {base} no longer matches HEAD {current}; re-run `breeze edit {path}`"
+                "STALE {label} patch base {base} no longer matches HEAD {current}; re-run `breeze edit {path}`"
             );
             problems += 1;
         }

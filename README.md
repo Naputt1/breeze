@@ -51,10 +51,11 @@ store file, so editing it there changes it everywhere.
 For a tracked file that needs local changes:
 
 ```sh
-breeze edit fog.json             # record a local patch
+breeze edit fog.json --name api-timeout  # record a named local patch
 breeze sync --all                # apply it to every worktree
 breeze diff fog.json             # inspect overlay changes
-breeze revert fog.json           # drop the overlay and restore tracked content
+breeze revert fog.json           # archive the patch, restore tracked content
+breeze restore api-timeout       # re-apply an archived patch later
 ```
 
 ## Commands
@@ -71,23 +72,25 @@ Global flags accepted by every command:
 | Command | Description |
 | --- | --- |
 | `breeze init` | Create the Breeze store for the repository. Safe to rerun. |
-| `breeze status [--json]` | Show repository, worktree, store and overlay status. `--json` includes per-override `path`/`mode`/`layer`/`source`, stale patches, and a doctor-lite `issues` count. |
+| `breeze status [--json]` | Show repository, worktree, store and overlay status. `--json` includes per-override `path`/`mode`/`layer`/`source`/`name`, stale patches, and a doctor-lite `issues` count. Named patches are shown as `name (path)`. |
 | `breeze link <PATH> [--layer shared\|branch\|worktree] [--all-worktrees]` | Link an untracked file. The default layer is `shared`; `branch` and `worktree` override it locally. `--all-worktrees` is accepted for compatibility; a link already applies to every worktree its layer covers. |
 | `breeze unlink <PATH> [--force]` | Remove link overrides and restore real files. `--force` allows replacing locally modified copies, with a backup. |
-| `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>]` | Edit a tracked file and record the result as a patch (default layer `branch`). |
+| `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>] [--name <NAME>]` | Edit a tracked file and record the result as a patch (default layer `branch`). `--name` sets or updates a repository-unique patch name (`[a-z0-9][a-z0-9._-]{0,63}`), stored in both the override and patch metadata. |
 | `breeze sync [--all] [--path <PATH>] [--dry-run] [--links-only]` | Repair symlinks and re-apply patches. `--links-only` repairs links without applying tracked patches. Defaults to the current worktree; `--all` covers every worktree. |
-| `breeze diff [PATH] [--stat]` | Show changes between overlays and the working tree. |
-| `breeze revert [<PATH>] [--all] [--force]` | Remove overlay changes for one file or every patch and restore tracked content. |
-| `breeze promote <PATH>` | Turn a recorded patch into ordinary tracked content, ready to commit. |
-| `breeze share <PATH>` | Move a branch or worktree override up to the shared layer. |
+| `breeze diff [PATH] [--stat]` | Show changes between overlays and the working tree. Named patches use a `# patch: <name> (<layer>, <path>)` header. |
+| `breeze revert [<PATH>] [--name <NAME>] [--all] [--force]` | Archive one file or every patch to `<layer>/backups/patches/`, then remove the overlay and restore tracked content. |
+| `breeze restore <NAME> [--layer <LAYER>]` | Re-apply an archived patch by name and record it again. Use `--layer` when the name is archived in more than one layer. |
+| `breeze patches [--json]` | List active and archived patches with name, path, layer, staleness and archive state. Read-only. |
+| `breeze promote <PATH>` | Turn a recorded patch into ordinary tracked content, ready to commit. The patch is archived first. |
+| `breeze share <PATH>` | Move a branch or worktree override up to the shared layer. The matching archive moves too. |
 | `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
 | `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
 | `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, and a best-effort `pre-rebase`). |
 | `breeze guard uninstall` | Remove managed hooks and restore backed-up hooks. |
 | `breeze guard status` | Report installed hooks and backups. |
-| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. |
-| `breeze gc [--force]` | Remove store data for worktrees that no longer exist, stale fog temp configs, empty directories and orphan patches. `--force` also deletes unused store files and keeps only the five newest backups per repository. |
+| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions and missing worktrees. `--fix` repairs what it safely can. Named patches are identified as `name (path)`. |
+| `breeze gc [--force]` | Remove store data for worktrees that no longer exist, stale fog temp configs, empty directories and orphan patches. Archived patches are reported but never deleted. `--force` also deletes unused store files and keeps only the five newest backups per repository. |
 | `breeze version` | Print the version. |
 | `breeze completions <bash\|zsh\|fish>` | Print a completion script (hidden helper). |
 
@@ -98,7 +101,14 @@ Overrides resolve from least to most specific: `shared`, then `branch`, then
 chosen automatically for `sync`, and recorded explicitly for `link`/`edit`.
 `breeze share <PATH>` moves a branch or worktree link or patch to `shared`;
 a shared patch applies to every branch and worktree on the next
-`breeze sync --all`.
+`breeze sync --all`. Moving a patch also moves its archived copy.
+
+Patch names are optional and repository-wide unique across live and archived
+patches. `revert` archives a patch before deleting it: named patches keep their
+name, while unnamed patches use a fallback of the sanitized path plus eight
+hash characters (for example `fog-json-3f9c1a2b`). `breeze restore <name>`
+re-applies an archive, records it again with its original name, and keeps the
+archive. If the same name exists in several layers, pass `--layer`.
 
 ### Guard hooks
 
@@ -147,15 +157,16 @@ sync needs attention; run breeze doctor`.
   `breeze sync --all`.
   `post-rewrite` serves both rebases and `git commit --amend`; `post-applypatch`
   runs after a successful `git am`.
-- `pre-rebase` lists active tracked patches and blocks with exit `6`, pointing
-  at `breeze revert --all`, and allows the rebase when no patches are active.
+- `pre-rebase` lists active tracked patches as `name (path)` and blocks with
+  exit `6`, pointing at `breeze revert --all` and `breeze restore` for later,
+  and allows the rebase when no patches are active.
   This is best effort: Git rejects a dirty worktree before running any
   `pre-rebase` hook, so a normal applied patch aborts with Git's own
   "unstaged changes" error before Breeze can speak. Neither the patch content
   nor its record is changed in that case. There is no auto-revert or suspend
-  mode: `breeze revert` deletes the record, and running it from `pre-rebase`
-  would leave the worktree dirty and make Git abort the rebase anyway. Run
-  `breeze revert --all` explicitly before rebasing.
+  mode: reverting from `pre-rebase` would leave the worktree dirty and make Git
+  abort the rebase anyway. Run `breeze revert --all` explicitly before
+  rebasing, then `breeze restore <name>` afterwards.
 - `pre-merge-commit` and `pre-applypatch` are deliberately not installed:
   they run before the index/worktree is complete, so they cannot decide safely
   whether to sync, and `post-merge`/`post-applypatch` cover the success case.
@@ -218,7 +229,8 @@ coverage.
   `breeze sync --all` to recreate them from the store.
 - `git reset --hard`, `git restore` and `git checkout -- <file>` can discard
   tracked patch content. The patch record is not automatically dropped; use
-  `breeze revert <file>` to remove it, or `breeze sync --all` to reapply it.
+  `breeze revert <file>` to archive and remove it, `breeze restore <name>` to
+  reapply an archive, or `breeze sync --all` to reapply it.
 - `--no-verify` bypasses the commit and push guards, and a custom
   `core.hooksPath` is refused rather than fought. Server-side push protection
   remains the authoritative safeguard.
@@ -230,13 +242,15 @@ coverage.
   on it to refresh the patch base, and retry. `breeze doctor` reports stale
   patches whose base no longer matches `HEAD`.
 - `pre-rebase` cannot protect a worktree Git already considers dirty, which is
-  the normal state of an applied patch. `post-checkout` never applies tracked
+- `pre-rebase` cannot protect a worktree Git already considers dirty, which is
+  the normal state of an applied patch, and `post-checkout` cannot reapply
+  patches on a file restore by design. `post-checkout` never applies tracked
   patches, by design, because Git invokes it during internal rebase,
   cherry-pick and revert checkouts as well as explicit branch switches.
-- There is no safe automatic patch suspension for rebases. `breeze revert`
-  removes records rather than suspending them, so automatic reverting inside
-  `pre-rebase` is not offered; use `breeze revert --all` explicitly, rebase,
-  then re-apply with `breeze edit`/`breeze sync`.
+- There is no automatic patch suspension inside Git hooks. `breeze revert`
+  archives patches instead of discarding them, so the recovery is to run
+  `breeze revert --all` before a rebase and `breeze restore <name>` afterwards;
+  resolve any conflicting restore, then run `breeze edit <path> --name <name>`.
 - There is no `breeze git`/`breeze pull` wrapper in this version; the manual
   recovery for any uncovered operation is `breeze sync --all`, plus
   `breeze revert --all` before history rewrites and `breeze edit` after
@@ -248,8 +262,8 @@ coverage.
 | --- | --- |
 | `0` | Success. |
 | `1` | General failure. |
-| `2` | Usage error: bad arguments, missing override, or nothing to do. |
-| `3` | Patch conflict: a patch did not apply cleanly. |
+| `2` | Usage error: bad arguments, missing override, duplicate patch name, or nothing to do. |
+| `3` | Patch conflict: a patch did not apply cleanly, or an archive cannot be restored because the target is missing from `HEAD`. |
 | `4` | Repository not initialized; run `breeze init`. |
 | `5` | Unsafe operation refused (tracked file, differing copy, custom hooks path, …). |
 | `6` | A guard hook blocked a commit or push. |
@@ -270,13 +284,15 @@ repos/<repo_id>/
   shared/
     files/<path>            link targets in the shared layer
     patches/<path>.patch    shared patches
-    patches/<path>.json     patch metadata (base blob, applied hash)
+    patches/<path>.json     patch metadata (name, base blob, applied hash)
+    backups/patches/<name>.patch  archived shared patch
+    backups/patches/<name>.json   archive sidecar
     env                     overlay environment (input for `breeze env`/`run`)
     fog.local.json          overlay fog configuration
   branches/<branch_id>/
-    files/ patches/ env? fog.local.json?
+    files/ patches/ backups/patches/ env? fog.local.json?
   worktrees/<worktree_id>/
-    files/ patches/ fog.local.json?
+    files/ patches/ backups/patches/ fog.local.json?
   state/
     overrides.json          recorded overrides
     events.log              append-only action log
@@ -308,7 +324,8 @@ An `exclude` block in `.git/info/exclude` keeps overlay paths out of
   amends and `git am` never fail because of Breeze. They embed the absolute
   `breeze` path and never execute a binary found on `PATH`.
 - `gc` never touches the current branch layer or files backing live overrides
-  unless `--force` is given.
+  unless `--force` is given. Archived patches are only reported, never deleted,
+  and live under `0700` directories with `0600` files like the rest of the store.
 - `promote` is the only command that turns local overlay content into tracked
   content; it still leaves the actual `git add`/`git commit` to you.
 

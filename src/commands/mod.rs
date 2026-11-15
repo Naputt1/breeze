@@ -1,5 +1,6 @@
 //! Command dispatch.
 
+mod archive;
 pub mod completions;
 pub mod diff;
 pub mod doctor;
@@ -10,7 +11,9 @@ pub mod gc;
 pub mod guard;
 pub mod init;
 pub mod link;
+pub mod patches;
 pub mod promote;
+pub mod restore;
 pub mod revert;
 pub mod run;
 pub mod share;
@@ -47,6 +50,8 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Sync(args) => sync::run(&ctx, &args),
         Command::Diff(args) => diff::run(&ctx, &args),
         Command::Revert(args) => revert::run(&ctx, &args),
+        Command::Restore(args) => restore::run(&ctx, &args),
+        Command::Patches => patches::run(&ctx),
         Command::Promote(args) => promote::run(&ctx, &args),
         Command::Share(args) => share::run(&ctx, &args),
         Command::Env(args) => env::run(&ctx, &args),

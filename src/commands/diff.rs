@@ -65,7 +65,8 @@ fn show_patch(repo: &Repo, path: &str, entry: &OverrideEntry, stat: bool) -> Res
     let patch_file = repo.layout.repo_dir.join(&entry.source);
     if !Repo::is_regular_store_file(&patch_file) {
         println!(
-            "MISSING {path} patch file (or it is not a regular file): {}",
+            "MISSING {} patch file (or it is not a regular file): {}",
+            entry.label(),
             patch_file.display()
         );
         return Ok(());
@@ -75,14 +76,20 @@ fn show_patch(repo: &Repo, path: &str, entry: &OverrideEntry, stat: bool) -> Res
         .with_context(|| format!("failed to read {}", patch_file.display()))?;
 
     if stat {
+        match &entry.name {
+            Some(name) => println!("# patch: {name} ({}, {path})", entry.layer),
+            None => println!("{path} (patch, {} layer)", entry.layer),
+        }
         let summary = patch_stat(repo, &text)?;
-        println!("{path} (patch, {} layer)", entry.layer);
         print!("{summary}");
         if !summary.ends_with('\n') {
             println!();
         }
     } else {
-        println!("# {path} (patch, {} layer)", entry.layer);
+        match &entry.name {
+            Some(name) => println!("# patch: {name} ({}, {path})", entry.layer),
+            None => println!("# {path} (patch, {} layer)", entry.layer),
+        }
         print!("{text}");
         if !text.ends_with('\n') {
             println!();

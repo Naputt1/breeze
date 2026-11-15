@@ -106,6 +106,7 @@ pub fn run(ctx: &Ctx, args: &LinkArgs) -> Result<i32> {
         source: source.clone(),
         tracked: false,
         base_sha: None,
+        name: None,
         created_at: now.clone(),
         updated_at: now,
     });

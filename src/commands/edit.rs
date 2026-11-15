@@ -7,7 +7,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::cli::EditArgs;
-use crate::commands::Ctx;
+use crate::commands::{archive, Ctx};
 use crate::exit::{self, CommandError};
 use crate::store::now_rfc3339;
 use crate::store::overlay::{self, Layer, Repo};
@@ -28,6 +28,12 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     // Validate the layer early: the branch layer needs a checked-out branch.
     let layer_dir = repo.layer_dir(layer)?;
 
+    let mut overrides = repo.overrides()?;
+    if let Some(name) = &args.name {
+        patches::validate_name(name)?;
+        archive::ensure_name_available(&repo, &overrides, name, &relative, layer)?;
+    }
+
     let base_blob = patches::head_blob(&repo.info.root, &relative)?.ok_or_else(|| {
         CommandError::new(
             exit::GENERAL,
@@ -40,7 +46,6 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     run_editor(&repo.info.root, &editor, &worktree_path)?;
 
     let diff = patches::generate_diff(&repo.info.root, &relative)?;
-    let mut overrides = repo.overrides()?;
 
     if diff.trim().is_empty() {
         return undo(&repo, &mut overrides, &relative, ctx);
@@ -59,6 +64,21 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     let created_at = patches::read_metadata(&files.metadata)
         .map(|metadata| metadata.created_at)
         .unwrap_or_else(|_| now.clone());
+    let previous = patches::read_metadata(&files.metadata).ok();
+    let existing_name = overrides
+        .overrides
+        .iter()
+        .find(|entry| {
+            entry.path == relative
+                && entry.layer == layer.name()
+                && entry.mode == OverrideMode::Patch
+        })
+        .and_then(|entry| entry.name.clone());
+    let name = args
+        .name
+        .clone()
+        .or(existing_name)
+        .or_else(|| previous.and_then(|metadata| metadata.name));
 
     let base_display = patches::short(&base_blob).to_string();
     repo.write_store_file(&files.patch, diff.as_bytes())?;
@@ -69,6 +89,7 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
             base_sha: base_sha.clone(),
             base_blob,
             applied_hash,
+            name: name.clone(),
             created_at: created_at.clone(),
             updated_at: now.clone(),
         },
@@ -82,6 +103,7 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         source,
         tracked: true,
         base_sha: Some(base_sha),
+        name: name.clone(),
         created_at,
         updated_at: now,
     });
@@ -90,6 +112,9 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
 
     if !ctx.quiet {
         println!("edited {relative} ({} layer)", layer.name());
+        if let Some(name) = &name {
+            println!("name:   {name}");
+        }
         println!("patch:  {}", files.patch.display());
         println!("base:   {base_display}");
         println!("file:   {} (modified, not staged)", worktree_path.display());
@@ -383,5 +408,96 @@ pub(crate) mod tests {
 
         let overrides = fs::read_to_string(repo.store_dir().join("state/overrides.json")).unwrap();
         assert!(!overrides.contains("fog.json"), "{overrides}");
+    }
+
+    #[test]
+    fn edit_name_is_stored_in_both_files_and_displayed() {
+        let repo = TempRepo::new("edit-name");
+        commit_file(&repo, "fog.json", "base\n");
+
+        let editor = write_editor(&repo, "name-add", "printf 'local\\n' >> \"$1\"");
+        let output = repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-timeout",
+            "--editor",
+            &editor,
+        ]);
+        assert!(output.contains("name:   api-timeout"), "{output}");
+
+        let patch_dir = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main))
+            .join("patches");
+        let overrides = fs::read_to_string(repo.store_dir().join("state/overrides.json")).unwrap();
+        assert!(
+            overrides.contains("\"name\": \"api-timeout\""),
+            "{overrides}"
+        );
+        let metadata = fs::read_to_string(patch_dir.join("fog.json.json")).unwrap();
+        assert!(metadata.contains("\"name\": \"api-timeout\""), "{metadata}");
+
+        let status = repo.breeze_ok(&["status"]);
+        assert!(status.contains("api-timeout (fog.json)"), "{status}");
+        let status_json = repo.breeze_ok(&["status", "--json"]);
+        assert!(
+            status_json.contains("\"name\": \"api-timeout\""),
+            "{status_json}"
+        );
+        let diff = repo.breeze_ok(&["diff"]);
+        assert!(
+            diff.contains("# patch: api-timeout (branch, fog.json)"),
+            "{diff}"
+        );
+
+        // Updating the name in place is allowed.
+        let rename = write_editor(&repo, "rename-add", "printf 'more\\n' >> \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-later",
+            "--editor",
+            &rename,
+        ]);
+        let metadata = fs::read_to_string(patch_dir.join("fog.json.json")).unwrap();
+        assert!(metadata.contains("\"name\": \"api-later\""), "{metadata}");
+    }
+
+    #[test]
+    fn edit_rejects_invalid_and_duplicate_patch_names() {
+        let repo = TempRepo::new("edit-name-dup");
+        commit_file(&repo, "fog.json", "base\n");
+        commit_file(&repo, "other.json", "other\n");
+
+        let editor = write_editor(&repo, "dup-add", "printf 'local\\n' >> \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--name",
+            "api-timeout",
+            "--editor",
+            &editor,
+        ]);
+
+        let (code, stderr) = repo.breeze_err(&[
+            "edit", "fog.json", "--name", "Bad Name", "--editor", &editor,
+        ]);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("invalid patch name"), "{stderr}");
+
+        let (code, stderr) = repo.breeze_err(&[
+            "edit",
+            "other.json",
+            "--name",
+            "api-timeout",
+            "--editor",
+            &editor,
+        ]);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("api-timeout"), "{stderr}");
+        assert!(stderr.contains("fog.json"), "{stderr}");
     }
 }
