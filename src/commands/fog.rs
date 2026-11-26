@@ -138,15 +138,33 @@ fn prepare(
     temp::prune_stale(&dir);
     let temp_path = temp::write_config(&dir, branch_label, std::process::id(), &merged)?;
 
-    let mut forwarded = Vec::with_capacity(remaining.len() + 2);
+    let mut forwarded = Vec::with_capacity(remaining.len() + 4);
     forwarded.push(OsString::from("-c"));
     forwarded.push(temp_path.clone().into_os_string());
+    // The merged config lives in Breeze's cache, so fog would otherwise treat
+    // that directory as the project root and resolve relative service paths
+    // there. Point fog back at the worktree it was invoked from. A
+    // user-supplied `--project-dir` wins and is never duplicated.
+    if !has_project_dir(&remaining) {
+        forwarded.push(OsString::from("--project-dir"));
+        forwarded.push(repo_root.as_os_str().to_os_string());
+    }
     forwarded.extend(remaining);
 
     Ok(Invocation {
         program: OsString::from(FOG_PROGRAM),
         args: forwarded,
         temp: Some(temp_path),
+    })
+}
+
+/// Whether the forwarded arguments already select a project root.
+fn has_project_dir(args: &[OsString]) -> bool {
+    args.iter().any(|arg| {
+        arg == OsStr::new("--project-dir")
+            || arg
+                .to_str()
+                .is_some_and(|text| text.starts_with("--project-dir="))
     })
 }
 
@@ -408,7 +426,9 @@ mod tests {
             temp_path.file_name().unwrap().to_string_lossy(),
             format!("main-abcdef12-{}.json", std::process::id())
         );
-        assert_eq!(&invocation.args[2..], original.as_slice());
+        assert_eq!(invocation.args[2], OsString::from("--project-dir"));
+        assert_eq!(invocation.args[3], fixture.repo.as_os_str().to_os_string());
+        assert_eq!(&invocation.args[4..], original.as_slice());
 
         let merged: Value =
             serde_json::from_str(&fs::read_to_string(&temp_path).expect("read temp"))
@@ -473,6 +493,13 @@ mod tests {
 
         assert!(invocation.temp.is_none());
         assert_eq!(invocation.args, original);
+        assert!(
+            !invocation
+                .args
+                .iter()
+                .any(|arg| arg == OsStr::new("--project-dir")),
+            "the fast path must not inject --project-dir"
+        );
         assert!(!fixture.cache().exists(), "no cache files on the fast path");
     }
 
@@ -506,8 +533,14 @@ mod tests {
         )
         .expect("json");
         assert_eq!(merged["ports"]["web"], 2);
-        assert_eq!(&invocation.args[2..], &[OsString::from("up")]);
-
+        assert_eq!(
+            &invocation.args[2..],
+            &[
+                OsString::from("--project-dir"),
+                repo.as_os_str().to_os_string(),
+                OsString::from("up")
+            ]
+        );
         // With no overlay the original arguments (including --config) pass through.
         let fast = prepare(
             &original,
@@ -521,6 +554,59 @@ mod tests {
         .expect("prepare fast path");
         assert!(fast.temp.is_none());
         assert_eq!(fast.args, original);
+    }
+
+    #[test]
+    fn merged_invocation_forwards_the_repo_root_as_project_dir() {
+        let fixture = Fixture::new("project-dir", BASE_CONFIG, OVERLAY);
+        let invocation = prepare(
+            &os_args(&["dev", "--port", "1234"]),
+            &fixture.repo,
+            "demo-12345678",
+            "main-abcdef12",
+            std::slice::from_ref(&fixture.shared),
+            &fixture.cache(),
+            true,
+        )
+        .expect("prepare invocation");
+
+        assert_eq!(invocation.args[0], OsString::from("-c"));
+        assert_eq!(invocation.args[2], OsString::from("--project-dir"));
+        assert_eq!(invocation.args[3], fixture.repo.as_os_str().to_os_string());
+    }
+
+    #[test]
+    fn user_project_dir_is_not_duplicated_in_the_merged_invocation() {
+        let fixture = Fixture::new("explicit-project-dir", BASE_CONFIG, OVERLAY);
+
+        for explicit in [
+            os_args(&["dev", "--project-dir", "/elsewhere"]),
+            os_args(&["dev", "--project-dir=/elsewhere"]),
+        ] {
+            let invocation = prepare(
+                &explicit,
+                &fixture.repo,
+                "demo-12345678",
+                "main-abcdef12",
+                std::slice::from_ref(&fixture.shared),
+                &fixture.cache(),
+                true,
+            )
+            .expect("prepare invocation");
+
+            let injected = invocation
+                .args
+                .iter()
+                .filter(|arg| {
+                    *arg == OsStr::new("--project-dir")
+                        || arg
+                            .to_str()
+                            .is_some_and(|text| text.starts_with("--project-dir="))
+                })
+                .count();
+            assert_eq!(injected, 1, "explicit --project-dir must be preserved once");
+            assert_eq!(&invocation.args[2..], explicit.as_slice());
+        }
     }
 
     #[test]
@@ -628,6 +714,8 @@ mod tests {
         let expected = vec![
             "-c",
             temp_path.to_str().expect("utf-8 temp path"),
+            "--project-dir",
+            fixture.repo.to_str().expect("utf-8 repo path"),
             "up",
             "--port",
             "1234",

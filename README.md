@@ -85,7 +85,7 @@ Global flags accepted by every command:
 | `breeze share <PATH>` | Move a branch or worktree override up to the shared layer. The matching archive moves too. |
 | `breeze env [--format dotenv\|shell\|json] [--write] [--show] [--reveal]` | Print the resolved environment. Values are masked unless `--reveal` is confirmed on a terminal. `--write` writes the merged values to `.env.local` in the current worktree; an existing file is backed up in the store and replaced only with `--force`. |
 | `breeze run -- <CMD> [ARGS...]` | Run a command with overlay environment variables applied. |
-| `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. |
+| `breeze fog [ARGS...]` | Forward arguments to `fog`, merging overlay configuration first. When an overlay is merged, Breeze adds `--project-dir <worktree>` so relative service paths still resolve in the worktree; the fast path (no overlays) forwards your arguments unchanged. |
 | `breeze guard install [--with-post-checkout] [--with-pull-hooks] [--with-all-hooks]` | Install the `pre-commit`/`pre-push` guard hooks. `--with-post-checkout` adds `post-checkout`; `--with-pull-hooks` adds `post-merge`/`post-rewrite`; `--with-all-hooks` adds every available hook (`post-checkout`, `post-merge`, `post-rewrite`, `post-applypatch`, and a best-effort `pre-rebase`). |
 | `breeze guard uninstall` | Remove managed hooks, restore backed-up hooks, and disable filter mode if it is enabled. |
 | `breeze guard status` | Report installed hooks and backups, plus filter-mode health when enabled. |
