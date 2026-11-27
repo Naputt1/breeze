@@ -12,21 +12,24 @@ pub fn run(ctx: &Ctx, args: &PromoteArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
     let relative = overlay::relative_lenient_path(&repo, &args.path)?;
 
+    let target = repo.current_target();
     let mut overrides = repo.overrides()?;
-    let entries: Vec<_> = overrides
-        .overrides
-        .iter()
-        .filter(|entry| entry.path == relative && entry.mode == OverrideMode::Patch)
-        .cloned()
-        .collect();
+    let entry = overlay::best_entry(
+        overrides
+            .overrides
+            .iter()
+            .filter(|entry| entry.path == relative && entry.mode == OverrideMode::Patch),
+        &target,
+    )
+    .cloned();
 
-    if entries.is_empty() {
+    let Some(entry) = entry else {
         return Err(CommandError::new(
             exit::USAGE,
-            format!("no patch overlay recorded for `{relative}`"),
+            format!("no patch overlay applies to `{relative}` in this branch or worktree"),
         )
         .into());
-    }
+    };
 
     let filter_mode = crate::store::filters::enabled(&repo.info.root);
     let mut diverged_targets = std::collections::BTreeSet::new();
@@ -35,7 +38,7 @@ pub fn run(ctx: &Ctx, args: &PromoteArgs) -> Result<i32> {
             if target.path == repo.info.root {
                 continue;
             }
-            let Some(entry) = overlay::best_entry(entries.iter(), &target) else {
+            let Some(entry) = overlay::best_entry(std::iter::once(&entry), &target) else {
                 continue;
             };
             if crate::store::filters::manual_diverged(&repo, &target.path, &relative, entry)? {
@@ -43,9 +46,9 @@ pub fn run(ctx: &Ctx, args: &PromoteArgs) -> Result<i32> {
             }
         }
     }
-    let archived = crate::commands::archive::archive_entries(&repo, &entries)?;
+    let archived = crate::commands::archive::archive_entries(&repo, std::slice::from_ref(&entry))?;
 
-    crate::commands::edit::remove_patch_entries(&repo, &mut overrides, &relative)?;
+    crate::commands::edit::remove_patch_source(&repo, &mut overrides, &relative, &entry.source)?;
     repo.save_overrides(&overrides)?;
     if filter_mode {
         // The patched file stays on disk in this worktree; only its
@@ -123,6 +126,62 @@ mod tests {
 
         let status = repo.git(&repo.main, &["status", "--porcelain"]);
         assert!(status.contains("fog.json"), "{status}");
+    }
+
+    #[test]
+    fn promote_leaves_patches_recorded_for_other_branches() {
+        let repo = TempRepo::new("promote-branch-scope");
+        repo.write("fog.json", "base\n");
+        repo.git(&repo.main, &["add", "fog.json"]);
+        repo.git(&repo.main, &["commit", "-m", "add fog"]);
+        let main_branch = repo.branch_id(&repo.main);
+
+        let main_editor = repo.base.join("promote-scope-main.sh");
+        fs::write(&main_editor, "#!/bin/sh\nprintf 'main-local\\n' > \"$1\"\n").unwrap();
+        fs::set_permissions(&main_editor, fs::Permissions::from_mode(0o755)).unwrap();
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            main_editor.to_str().unwrap(),
+        ]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_branch = repo.branch_id(&repo.main);
+        let side_editor = repo.base.join("promote-scope-side.sh");
+        fs::write(&side_editor, "#!/bin/sh\nprintf 'side-local\\n' > \"$1\"\n").unwrap();
+        fs::set_permissions(&side_editor, fs::Permissions::from_mode(0o755)).unwrap();
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            side_editor.to_str().unwrap(),
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        repo.breeze_ok(&["promote", "fog.json"]);
+
+        let store = repo.store_dir();
+        assert!(!store
+            .join("branches")
+            .join(&main_branch)
+            .join("patches/fog.json.patch")
+            .exists());
+        assert!(store
+            .join("branches")
+            .join(&side_branch)
+            .join("patches/fog.json.patch")
+            .is_file());
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+
+        repo.git(&repo.main, &["switch", "side"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "side-local\n");
     }
 
     #[test]

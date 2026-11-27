@@ -188,12 +188,16 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
 
 /// Check stored patches for missing data, duplicate layers and a stale base.
 fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
+    let target = repo.current_target();
     let mut grouped: BTreeMap<String, Vec<&OverrideEntry>> = BTreeMap::new();
     for entry in overrides
         .overrides
         .iter()
         .filter(|entry| entry.mode == OverrideMode::Patch)
     {
+        if !crate::store::overlay::entry_applies(entry, &target) {
+            continue;
+        }
         grouped.entry(entry.path.clone()).or_default().push(entry);
     }
 

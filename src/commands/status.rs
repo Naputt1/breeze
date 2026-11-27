@@ -137,8 +137,12 @@ fn stale_patches(repo: &Repo, patches_entries: &[&OverrideEntry]) -> Result<Vec<
     if crate::store::filters::enabled(&repo.info.root) {
         return Ok(Vec::new());
     }
+    let current = repo.current_target();
     let mut best: BTreeMap<&str, &OverrideEntry> = BTreeMap::new();
     for entry in patches_entries {
+        if !crate::store::overlay::entry_applies(entry, &current) {
+            continue;
+        }
         match best.entry(entry.path.as_str()) {
             Entry::Vacant(slot) => {
                 slot.insert(entry);
