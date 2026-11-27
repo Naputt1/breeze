@@ -24,13 +24,25 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
         return revert_all(&repo, ctx, args.force);
     }
     let relative = if let Some(name) = &args.name {
+        let current = repo.current_target();
         let overrides = repo.overrides()?;
-        let entry = overrides
+        let matching: Vec<&OverrideEntry> = overrides
             .overrides
             .iter()
-            .find(|entry| entry.mode == OverrideMode::Patch && entry.name.as_deref() == Some(name))
+            .filter(|entry| {
+                entry.mode == OverrideMode::Patch && entry.name.as_deref() == Some(name)
+            })
+            .collect();
+        let entry = matching
+            .iter()
+            .find(|entry| overlay::entry_applies(entry, &current))
             .ok_or_else(|| {
-                CommandError::new(exit::USAGE, format!("no patch overlay named `{name}`"))
+                let message = if matching.is_empty() {
+                    format!("no patch overlay named `{name}`")
+                } else {
+                    format!("patch overlay `{name}` is recorded for another branch or worktree")
+                };
+                CommandError::new(exit::USAGE, message)
             })?;
         entry.path.clone()
     } else {
@@ -46,11 +58,14 @@ pub fn run(ctx: &Ctx, args: &RevertArgs) -> Result<i32> {
 }
 
 fn revert_all(repo: &Repo, ctx: &Ctx, force: bool) -> Result<i32> {
+    let current = repo.current_target();
     let overrides = repo.overrides()?;
     let mut paths: Vec<String> = overrides
         .overrides
         .iter()
-        .filter(|entry| entry.mode == OverrideMode::Patch)
+        .filter(|entry| {
+            entry.mode == OverrideMode::Patch && overlay::entry_applies(entry, &current)
+        })
         .map(|entry| entry.path.clone())
         .collect();
     paths.sort();
@@ -70,20 +85,30 @@ fn revert_all(repo: &Repo, ctx: &Ctx, force: bool) -> Result<i32> {
 }
 
 pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: bool) -> Result<i32> {
+    let current = repo.current_target();
     let mut overrides = repo.overrides()?;
     let patch_entries: Vec<_> = overrides
         .overrides
         .iter()
-        .filter(|entry| entry.path == relative && entry.mode == OverrideMode::Patch)
+        .filter(|entry| {
+            entry.path == relative
+                && entry.mode == OverrideMode::Patch
+                && overlay::entry_applies(entry, &current)
+        })
         .cloned()
         .collect();
 
     if patch_entries.is_empty() {
-        return Err(CommandError::new(
-            exit::USAGE,
-            format!("no patch overlay recorded for `{relative}`"),
-        )
-        .into());
+        let recorded = overrides
+            .overrides
+            .iter()
+            .any(|entry| entry.path == relative && entry.mode == OverrideMode::Patch);
+        let message = if recorded {
+            format!("no patch overlay for `{relative}` applies to this branch or worktree")
+        } else {
+            format!("no patch overlay recorded for `{relative}`")
+        };
+        return Err(CommandError::new(exit::USAGE, message).into());
     }
 
     if crate::store::filters::enabled(&repo.info.root) {
@@ -114,7 +139,6 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
         });
     }
 
-    let current = repo.current_target();
     let Some(current_entry) = overlay::best_entry(patch_entries.iter(), &current) else {
         return Err(CommandError::new(
             exit::USAGE,
@@ -204,9 +228,11 @@ pub(crate) fn revert_relative(repo: &Repo, ctx: &Ctx, relative: &str, force: boo
         patches::remove_patch_files(&patch_file)?;
         repo.prune_empty_parents(&patch_file);
     }
-    overrides
-        .overrides
-        .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Patch));
+    overrides.overrides.retain(|entry| {
+        !(entry.path == relative
+            && entry.mode == OverrideMode::Patch
+            && patch_entries.iter().any(|kept| kept.source == entry.source))
+    });
     repo.save_overrides(&overrides)?;
     repo.log_event("revert", relative)?;
 
@@ -298,15 +324,20 @@ fn revert_filter(
         patches::remove_patch_files(&patch_file)?;
         repo.prune_empty_parents(&patch_file);
     }
-    overrides
-        .overrides
-        .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Patch));
+    overrides.overrides.retain(|entry| {
+        !(entry.path == relative
+            && entry.mode == OverrideMode::Patch
+            && patch_entries.iter().any(|kept| kept.source == entry.source))
+    });
     repo.save_overrides(overrides)?;
     filters::sync_attributes(repo, overrides)?;
 
     let mut restored = 0usize;
     let mut warnings = Vec::new();
     for target in repo.worktree_targets(false) {
+        if overlay::best_entry(patch_entries.iter(), &target).is_none() {
+            continue;
+        }
         let file = target.path.join(relative);
         if target.path != repo.info.root && !file.exists() {
             continue;
@@ -347,7 +378,7 @@ fn write_base(path: &Path, contents: &[u8]) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    patches::write_worktree_file(path, contents)
 }
 
 #[cfg(test)]
@@ -386,6 +417,63 @@ mod tests {
             .store_dir()
             .join("shared/patches/fog.json.patch")
             .exists());
+    }
+
+    #[test]
+    fn revert_leaves_patches_recorded_for_other_branches() {
+        let repo = TempRepo::new("revert-branch-scope");
+        commit_file(&repo, "fog.json", "base\n");
+        let main_branch = repo.branch_id(&repo.main);
+
+        let main_editor = write_editor(
+            &repo,
+            "revert-scope-main",
+            "printf 'main-local\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &main_editor,
+        ]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_branch = repo.branch_id(&repo.main);
+        let side_editor = write_editor(
+            &repo,
+            "revert-scope-side",
+            "printf 'side-local\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &side_editor,
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        repo.breeze_ok(&["revert", "fog.json"]);
+
+        let store = repo.store_dir();
+        assert!(!store
+            .join("branches")
+            .join(&main_branch)
+            .join("patches/fog.json.patch")
+            .exists());
+        assert!(store
+            .join("branches")
+            .join(&side_branch)
+            .join("patches/fog.json.patch")
+            .is_file());
+
+        repo.git(&repo.main, &["switch", "side"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "side-local\n");
     }
 
     #[test]
@@ -495,5 +583,50 @@ mod tests {
         }
         let fallback = fallback.expect("fallback archive name");
         assert_eq!(fallback.len(), "fog-json-".len() + 8, "{fallback}");
+    }
+
+    #[test]
+    fn revert_by_name_does_not_touch_another_branchs_patch() {
+        let repo = TempRepo::new("revert-name-scope");
+        commit_file(&repo, "fog.json", "base\n");
+        let main_editor =
+            write_editor(&repo, "revert-name-main", "printf 'main-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--name",
+            "mainp",
+            "--editor",
+            &main_editor,
+        ]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_editor =
+            write_editor(&repo, "revert-name-side", "printf 'side-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--name",
+            "sidep",
+            "--editor",
+            &side_editor,
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        let (code, stderr) = repo.breeze_err(&["revert", "--name", "sidep"]);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("another branch or worktree"), "{stderr}");
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        let overrides = fs::read_to_string(repo.store_dir().join("state/overrides.json")).unwrap();
+        assert!(overrides.contains("mainp"), "{overrides}");
+        assert!(overrides.contains("sidep"), "{overrides}");
     }
 }

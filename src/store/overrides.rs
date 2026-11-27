@@ -88,13 +88,16 @@ impl OverridesFile {
         super::write_json(path, self)
     }
 
-    /// Insert or replace an entry, keyed by path and layer.
+    /// Insert or replace an entry, keyed by path, layer and source.
+    ///
+    /// The source identifies the branch or worktree for scoped layers, so
+    /// overrides for the same path on different branches coexist.
     pub fn upsert(&mut self, entry: OverrideEntry) {
-        if let Some(existing) = self
-            .overrides
-            .iter_mut()
-            .find(|candidate| candidate.path == entry.path && candidate.layer == entry.layer)
-        {
+        if let Some(existing) = self.overrides.iter_mut().find(|candidate| {
+            candidate.path == entry.path
+                && candidate.layer == entry.layer
+                && candidate.source == entry.source
+        }) {
             let created_at = existing.created_at.clone();
             *existing = entry;
             existing.created_at = created_at;

@@ -151,6 +151,7 @@ pub(crate) fn ensure_name_available(
     name: &str,
     path: &str,
     layer: Layer,
+    source: &str,
 ) -> Result<()> {
     for entry in overrides
         .overrides
@@ -160,7 +161,7 @@ pub(crate) fn ensure_name_available(
         if entry.name.as_deref() != Some(name) {
             continue;
         }
-        if entry.path == path && entry.layer == layer.name() {
+        if entry.path == path && entry.layer == layer.name() && entry.source == source {
             continue;
         }
         return Err(CommandError::new(

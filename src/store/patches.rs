@@ -228,6 +228,11 @@ pub fn file_hash(path: &Path) -> Option<String> {
     fs::read(path).ok().map(|contents| hash_bytes(&contents))
 }
 
+/// Write worktree contents, preserving the mode of an existing file.
+pub fn write_worktree_file(path: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Whether `relative` is tracked as a submodule (mode 160000).
 pub fn is_submodule(root: &Path, relative: &str) -> Result<bool> {
     let output = git_output(root, &["ls-files", "--stage", "--", relative])?;

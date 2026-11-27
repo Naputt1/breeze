@@ -16,20 +16,27 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
     let relative = overlay::relative_lenient_path(&repo, &args.path)?;
 
+    let current = repo.current_target();
     let mut overrides = repo.overrides()?;
-    let entries: Vec<OverrideEntry> = overrides
+    let all_entries: Vec<OverrideEntry> = overrides
         .overrides
         .iter()
         .filter(|entry| entry.path == relative && entry.mode == OverrideMode::Link)
         .cloned()
         .collect();
+    let entries: Vec<OverrideEntry> = all_entries
+        .iter()
+        .filter(|entry| overlay::entry_applies(entry, &current))
+        .cloned()
+        .collect();
 
     if entries.is_empty() {
-        return Err(CommandError::new(
-            exit::USAGE,
-            format!("no link overlay recorded for `{relative}`"),
-        )
-        .into());
+        let message = if !all_entries.is_empty() {
+            format!("no link overlay for `{relative}` applies to this branch or worktree")
+        } else {
+            format!("no link overlay recorded for `{relative}`")
+        };
+        return Err(CommandError::new(exit::USAGE, message).into());
     }
 
     struct Restore {
@@ -42,9 +49,17 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
     let mut plan: Vec<Restore> = Vec::new();
 
     for target in &targets {
-        let Some(entry) = overlay::best_entry(entries.iter(), target) else {
+        // Decide from every recorded link, not only the ones selected here;
+        // a target whose effective link is another branch's must be left alone.
+        let Some(entry) = overlay::best_entry(all_entries.iter(), target) else {
             continue;
         };
+        if !entries
+            .iter()
+            .any(|selected| selected.source == entry.source)
+        {
+            continue;
+        }
         let store = repo.layout.repo_dir.join(&entry.source);
         let path = target.path.join(&relative);
 
@@ -125,9 +140,11 @@ pub fn run(ctx: &Ctx, args: &UnlinkArgs) -> Result<i32> {
         overlay::restore_copy(&item.store, &item.target)?;
     }
 
-    overrides
-        .overrides
-        .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Link));
+    overrides.overrides.retain(|entry| {
+        !(entry.path == relative
+            && entry.mode == OverrideMode::Link
+            && overlay::entry_applies(entry, &current))
+    });
     repo.save_overrides(&overrides)?;
 
     if !overrides
@@ -235,5 +252,93 @@ mod tests {
         let (code, stderr) = repo.breeze_err(&["unlink", "nope.txt"]);
         assert_eq!(code, 2);
         assert!(stderr.contains("no link overlay"), "{stderr}");
+    }
+
+    #[test]
+    fn unlink_leaves_links_recorded_for_other_branches() {
+        let repo = TempRepo::new("unlink-branch-scope");
+        repo.write("config/local.toml", "main content\n");
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        let main_branch = repo.branch_id(&repo.main);
+        let main_store = repo
+            .store_dir()
+            .join("branches")
+            .join(&main_branch)
+            .join("files/config/local.toml");
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_branch = repo.branch_id(&repo.main);
+        let side_store = repo
+            .store_dir()
+            .join("branches")
+            .join(&side_branch)
+            .join("files/config/local.toml");
+        // Replace the carried symlink so the side branch gets its own copy.
+        std::fs::remove_file(repo.main.join("config/local.toml")).unwrap();
+        std::fs::write(repo.main.join("config/local.toml"), "side content\n").unwrap();
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        repo.git(&repo.main, &["switch", "main"]);
+        repo.breeze_ok(&["sync"]);
+
+        repo.breeze_ok(&["unlink", "config/local.toml"]);
+
+        assert_eq!(repo.read(&repo.main, "config/local.toml"), "main content\n");
+        assert!(!main_store.exists());
+        assert!(side_store.is_file());
+        assert_eq!(
+            std::fs::read_to_string(&side_store).unwrap(),
+            "side content\n"
+        );
+        let overrides =
+            std::fs::read_to_string(repo.store_dir().join("state/overrides.json")).unwrap();
+        assert!(!overrides.contains(&main_branch), "{overrides}");
+        assert!(overrides.contains(&side_branch), "{overrides}");
+    }
+
+    #[test]
+    fn unlink_does_not_replace_another_branchs_effective_link() {
+        let repo = TempRepo::new("unlink-shared-vs-branch");
+        repo.write("config/local.toml", "shared content\n");
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "shared"]);
+
+        let side = repo.base.join("side");
+        repo.git(
+            &repo.main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                side.to_str().unwrap(),
+            ],
+        );
+        std::fs::create_dir_all(side.join("config")).unwrap();
+        std::fs::write(side.join("config/local.toml"), "side content\n").unwrap();
+        repo.breeze_ok_in(&side, &["link", "config/local.toml", "--layer", "branch"]);
+        let side_branch = repo.branch_id(&side);
+        let side_store = repo
+            .store_dir()
+            .join("branches")
+            .join(&side_branch)
+            .join("files/config/local.toml");
+        assert!(side_store.is_file());
+
+        repo.breeze_ok(&["unlink", "config/local.toml"]);
+
+        assert_eq!(
+            repo.read(&repo.main, "config/local.toml"),
+            "shared content\n"
+        );
+        let side_file = side.join("config/local.toml");
+        assert!(
+            std::fs::symlink_metadata(&side_file)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "side link was replaced"
+        );
+        assert_eq!(repo.read(&side, "config/local.toml"), "side content\n");
+        assert!(side_store.is_file());
     }
 }

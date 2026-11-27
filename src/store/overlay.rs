@@ -529,14 +529,58 @@ pub fn exists(path: &Path) -> bool {
 }
 
 /// Whether `link`, a symlink, resolves to `target`.
+///
+/// Dangling links and missing store copies still count: when canonicalisation
+/// fails the link destination and target are compared lexically, so a broken
+/// link into a store is recognised rather than mistaken for a user symlink.
 pub fn link_points_to(link: &Path, target: &Path) -> bool {
     if !is_symlink(link) {
         return false;
     }
     match (link.canonicalize(), target.canonicalize()) {
         (Ok(link_target), Ok(expected)) => link_target == expected,
-        _ => false,
+        _ => {
+            let Ok(destination) = fs::read_link(link) else {
+                return false;
+            };
+            let resolved = if destination.is_absolute() {
+                destination
+            } else {
+                link.parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(destination)
+            };
+            approximate_path(&resolved) == approximate_path(target)
+        }
     }
+}
+
+/// Canonicalise as much of `path` as exists, then append the rest lexically.
+fn approximate_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => approximate_path(parent).join(name),
+        _ => normalize_lexically(path),
+    }
+}
+
+/// Resolve `.` and `..` without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// Compute a relative path from `from_dir` to `target`.

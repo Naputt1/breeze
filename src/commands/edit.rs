@@ -40,11 +40,13 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
     };
     // Validate the layer early: the branch layer needs a checked-out branch.
     let layer_dir = repo.layer_dir(layer)?;
+    let files = patches::patch_files(&layer_dir, &relative);
+    let source = overlay::relative_string(&repo.layout.repo_dir, &files.patch);
 
     let mut overrides = repo.overrides()?;
     if let Some(name) = &args.name {
         patches::validate_name(name)?;
-        archive::ensure_name_available(&repo, &overrides, name, &relative, layer)?;
+        archive::ensure_name_available(&repo, &overrides, name, &relative, layer, &source)?;
     }
 
     let base_blob = patches::head_blob(&repo.info.root, &relative)?.ok_or_else(|| {
@@ -80,10 +82,9 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         None => diff.trim().is_empty(),
     };
     if unchanged {
-        return undo(&repo, &mut overrides, &relative, ctx);
+        return undo(&repo, &mut overrides, &relative, &source, ctx);
     }
 
-    let files = patches::patch_files(&layer_dir, &relative);
     warn_other_layers(&overrides, &relative, layer);
 
     let now = now_rfc3339();
@@ -98,6 +99,7 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         .find(|entry| {
             entry.path == relative
                 && entry.layer == layer.name()
+                && entry.source == source
                 && entry.mode == OverrideMode::Patch
         })
         .and_then(|entry| entry.name.clone());
@@ -125,7 +127,6 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<i32> {
         },
     )?;
 
-    let source = overlay::relative_string(&repo.layout.repo_dir, &files.patch);
     overrides.upsert(OverrideEntry {
         path: relative.clone(),
         mode: OverrideMode::Patch,
@@ -256,14 +257,15 @@ fn run_editor(root: &Path, command: &[String], path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The file now matches HEAD: drop every stored patch for the path.
+/// The file now matches HEAD: drop the patch stored for the current slot.
 fn undo(
     repo: &Repo,
     overrides: &mut crate::store::overrides::OverridesFile,
     relative: &str,
+    source: &str,
     ctx: &Ctx,
 ) -> Result<i32> {
-    let removed = remove_patch_entries(repo, overrides, relative)?;
+    let removed = remove_patch_source(repo, overrides, relative, source)?;
     repo.save_overrides(overrides)?;
 
     if crate::store::filters::enabled(&repo.info.root) {
@@ -282,22 +284,24 @@ fn undo(
     Ok(exit::SUCCESS)
 }
 
-/// Remove stored patch data and index entries for one path.
-pub fn remove_patch_entries(
+/// Remove the patch record and store files for one path and one layer slot.
+pub(crate) fn remove_patch_source(
     repo: &Repo,
     overrides: &mut crate::store::overrides::OverridesFile,
     relative: &str,
+    source: &str,
 ) -> Result<usize> {
+    let matches = |entry: &OverrideEntry| {
+        entry.path == relative && entry.mode == OverrideMode::Patch && entry.source == source
+    };
     let sources: Vec<String> = overrides
         .overrides
         .iter()
-        .filter(|entry| entry.path == relative && entry.mode == OverrideMode::Patch)
+        .filter(|entry| matches(entry))
         .map(|entry| entry.source.clone())
         .collect();
 
-    overrides
-        .overrides
-        .retain(|entry| !(entry.path == relative && entry.mode == OverrideMode::Patch));
+    overrides.overrides.retain(|entry| !matches(entry));
 
     for source in &sources {
         let patch_file = repo.layout.repo_dir.join(source);

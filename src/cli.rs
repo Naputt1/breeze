@@ -201,6 +201,11 @@ pub struct SyncArgs {
     /// Repair link overlays only; do not apply tracked patches.
     #[arg(long)]
     pub links_only: bool,
+
+    /// Restore HEAD content where a file still carries a patch that does not
+    /// apply to this branch or worktree.
+    #[arg(long)]
+    pub prune_inactive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -348,6 +353,13 @@ pub struct GuardInstallArgs {
     /// without applying tracked patches.
     #[arg(long)]
     pub with_post_checkout: bool,
+
+    /// Install the post-checkout hook in apply mode: after a user branch
+    /// switch or a new worktree, repair links and apply that worktree's
+    /// tracked patches. Git's internal rebase, cherry-pick, revert, merge and
+    /// bisect checkouts stay links-only. Implies `--with-post-checkout`.
+    #[arg(long)]
+    pub apply_on_checkout: bool,
 
     /// Also install the opt-in post-merge and post-rewrite hooks that run
     /// `breeze sync` after pulls, merges, rebases and amends.

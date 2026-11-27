@@ -31,6 +31,13 @@ const MANAGED_HOOKS: [&str; 7] = [
     PRE_REBASE,
 ];
 const MARKER: &str = "# breeze-managed (installed ";
+const CHECKOUT_APPLY_MARKER: &str = "# breeze-checkout-apply";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckoutMode {
+    Links,
+    Apply,
+}
 
 pub fn run(ctx: &Ctx, args: &GuardArgs) -> Result<i32> {
     let repo = Repo::open(ctx)?;
@@ -66,8 +73,20 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
     // worktree rather than the (possibly linked) worktree used to install.
     let root = repo.info.main_worktree.display().to_string();
 
+    let existing_checkout = fs::read_to_string(hooks_dir.join(POST_CHECKOUT)).unwrap_or_default();
+    let checkout_mode = if args.apply_on_checkout {
+        CheckoutMode::Apply
+    } else if args.with_post_checkout {
+        CheckoutMode::Links
+    } else if args.with_all_hooks && existing_checkout.contains(CHECKOUT_APPLY_MARKER) {
+        // Reinstalling every hook must not silently downgrade apply mode.
+        CheckoutMode::Apply
+    } else {
+        CheckoutMode::Links
+    };
+
     let mut names: Vec<&str> = HOOKS.to_vec();
-    if args.with_post_checkout || args.with_all_hooks {
+    if args.with_post_checkout || args.apply_on_checkout || args.with_all_hooks {
         names.push(POST_CHECKOUT);
     }
     if args.with_pull_hooks || args.with_all_hooks {
@@ -105,7 +124,7 @@ fn install(repo: &Repo, ctx: &Ctx, args: &GuardInstallArgs) -> Result<i32> {
         let script = match name {
             "pre-commit" => pre_commit_script(&overrides, &installed),
             "pre-push" => pre_push_script(&overrides, &installed),
-            POST_CHECKOUT => post_checkout_script(&binary, &root, &installed),
+            POST_CHECKOUT => post_checkout_script(&binary, &root, &installed, checkout_mode),
             POST_MERGE | POST_REWRITE | POST_APPLYPATCH => {
                 pull_hook_script(name, &binary, &root, &installed)
             }
@@ -248,20 +267,32 @@ fn status(repo: &Repo, ctx: &Ctx) -> Result<i32> {
     for name in MANAGED_HOOKS {
         let path = hooks_dir.join(name);
         let backup = backup_path(&hooks_dir, name);
-        let installed = fs::read_to_string(&path)
-            .map(|contents| contents.contains(MARKER.trim_end()))
-            .unwrap_or(false);
-        let state = if installed {
-            "installed"
-        } else {
+        let contents = fs::read_to_string(&path).unwrap_or_default();
+        let installed = contents.contains(MARKER.trim_end());
+        let state = if !installed {
             "not installed"
+        } else if name == POST_CHECKOUT {
+            if contents.contains(CHECKOUT_APPLY_MARKER) {
+                "installed (links + patches)"
+            } else {
+                "installed (links only)"
+            }
+        } else {
+            "installed"
         };
-        match opt_in_hint(name) {
-            Some(hint) if !installed => println!(
-                "{name}: {state} (opt-in: `breeze guard install {hint}`) ({})",
+        if name == POST_CHECKOUT && !installed {
+            println!(
+                "{name}: {state} (opt-in: `breeze guard install --apply-on-checkout` or `--with-post-checkout`) ({})",
                 path.display()
-            ),
-            _ => println!("{name}: {state} ({})", path.display()),
+            );
+        } else {
+            match opt_in_hint(name) {
+                Some(hint) if !installed => println!(
+                    "{name}: {state} (opt-in: `breeze guard install {hint}`) ({})",
+                    path.display()
+                ),
+                _ => println!("{name}: {state} ({})", path.display()),
+            }
         }
         if backup.is_file() {
             println!("  backup: {}", backup.display());
@@ -314,7 +345,7 @@ fn backup_path(hooks_dir: &Path, name: &str) -> PathBuf {
 
 fn opt_in_hint(name: &str) -> Option<&'static str> {
     match name {
-        POST_CHECKOUT => Some("--with-post-checkout"),
+        POST_CHECKOUT => Some("--apply-on-checkout"),
         POST_MERGE | POST_REWRITE => Some("--with-pull-hooks"),
         POST_APPLYPATCH | PRE_REBASE => Some("--with-all-hooks"),
         _ => None,
@@ -501,7 +532,14 @@ exit 0
         .replace("__OVERRIDDEN__", overridden_function())
 }
 
-fn post_checkout_script(binary: &str, root: &str, installed: &str) -> String {
+fn post_checkout_script(binary: &str, root: &str, installed: &str, mode: CheckoutMode) -> String {
+    match mode {
+        CheckoutMode::Links => post_checkout_links_script(binary, root, installed),
+        CheckoutMode::Apply => post_checkout_apply_script(binary, root, installed),
+    }
+}
+
+fn post_checkout_links_script(binary: &str, root: &str, installed: &str) -> String {
     let template = r#"#!/bin/sh
 # breeze-managed (installed __INSTALLED__)
 # Opt-in post-checkout hook: repair overlay links after a branch or worktree checkout.
@@ -526,6 +564,85 @@ if [ "$3" = "1" ]; then
       printf 'breeze: cannot read the Breeze store for %s (status exited %s); reinstall the hooks after moving the repository.\n' "$REPO" "$status" >&2
     elif ! "$BREEZE" --repo "$REPO" --quiet sync --all --links-only; then
       printf 'breeze: overlay sync needs attention; run breeze doctor\n' >&2
+    fi
+  fi
+fi
+
+backup="${0%/*}/post-checkout.breeze-backup"
+if [ -x "$backup" ]; then
+  "$backup" "$@" || true
+fi
+
+exit 0
+"#;
+
+    template
+        .replace("__INSTALLED__", installed)
+        .replace("__BINARY__", &shell_quote(binary))
+        .replace("__REPO__", &shell_quote(root))
+}
+
+fn post_checkout_apply_script(binary: &str, root: &str, installed: &str) -> String {
+    let template = r#"#!/bin/sh
+# breeze-managed (installed __INSTALLED__)
+# breeze-checkout-apply
+# Opt-in post-checkout hook: apply this worktree's tracked patches after a
+# user branch switch or a new worktree checkout.
+# Git also runs post-checkout for its own internal checkouts during rebase,
+# am, cherry-pick, revert, merge and bisect. While that state is present the
+# hook repairs links only, so the operation cannot be dirtied.
+# Git calls this for file checkouts ($3 = 0); those must not reapply patches.
+# Breeze must never fail the checkout, so every step is best effort.
+BREEZE=__BINARY__
+REPO=__REPO__
+
+if [ "$3" = "1" ]; then
+  if [ ! -x "$BREEZE" ]; then
+    printf 'breeze: warning: embedded binary not found at %s; run `breeze guard install` again.\n' "$BREEZE" >&2
+  else
+    TARGET=$(git rev-parse --show-toplevel 2>/dev/null) || TARGET="$REPO"
+    "$BREEZE" --repo "$TARGET" --quiet status >/dev/null 2>&1
+    status=$?
+    if [ "$status" -eq 4 ]; then
+      :
+    elif [ "$status" -ne 0 ]; then
+      printf 'breeze: cannot read the Breeze store for %s (status exited %s); reinstall the hooks after moving the repository.\n' "$TARGET" "$status" >&2
+    else
+      # A zero new commit means an unborn/orphan checkout: no patches apply.
+      case "$2" in
+        "") apply=0 ;;
+        *[!0]*) apply=1 ;;
+        *) apply=0 ;;
+      esac
+      if [ "$apply" = "1" ]; then
+        internal=0
+        for marker in rebase-merge rebase-apply sequencer; do
+          state=$(git rev-parse --git-path "$marker" 2>/dev/null) || state=""
+          if [ -n "$state" ] && [ -d "$state" ]; then
+            internal=1
+          fi
+        done
+        for marker in CHERRY_PICK_HEAD REVERT_HEAD MERGE_HEAD BISECT_START; do
+          state=$(git rev-parse --git-path "$marker" 2>/dev/null) || state=""
+          if [ -n "$state" ] && [ -e "$state" ]; then
+            internal=1
+          fi
+        done
+        if [ "$internal" = "0" ]; then
+          # Always prune: the checked-out branch may already have moved even
+          # when the commit did not (`git switch` between branches at the same
+          # commit). Content from a patch recorded for the old branch must not
+          # stay attached to the new one.
+          "$BREEZE" --repo "$TARGET" --quiet sync --prune-inactive >/dev/null 2>&1 || \
+            printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
+        else
+          "$BREEZE" --repo "$TARGET" --quiet sync --links-only >/dev/null 2>&1 || \
+            printf 'breeze: overlay sync needs attention; run breeze doctor\n' >&2
+        fi
+      else
+        "$BREEZE" --repo "$TARGET" --quiet sync --links-only >/dev/null 2>&1 || \
+          printf 'breeze: overlay sync needs attention; run breeze doctor\n' >&2
+      fi
     fi
   fi
 fi
@@ -1644,6 +1761,243 @@ mod tests {
         assert!(
             !fs::read_to_string(&stdin_marker).unwrap().is_empty(),
             "the chained hook did not receive stdin"
+        );
+    }
+
+    #[test]
+    fn apply_on_checkout_installs_both_modes_and_status_reports_mode() {
+        let repo = TempRepo::new("guard-apply-install");
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(status.contains("--apply-on-checkout"), "{status}");
+
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+        let path = hook(&repo, "post-checkout");
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("breeze-checkout-apply"), "{contents}");
+        assert!(contents.contains("sync --prune-inactive"), "{contents}");
+        assert!(contents.contains("rev-parse --show-toplevel"), "{contents}");
+        assert!(contents.contains("rebase-merge"), "{contents}");
+        assert!(
+            contents.contains("breeze: patch sync needs attention; run breeze doctor"),
+            "{contents}"
+        );
+        assert!(!contents.contains("sync --all --links-only"), "{contents}");
+
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(
+            status.contains("post-checkout: installed (links + patches)"),
+            "{status}"
+        );
+
+        // Reinstalling every hook must not silently downgrade apply mode.
+        repo.breeze_ok(&["guard", "install", "--with-all-hooks"]);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("breeze-checkout-apply"), "{contents}");
+
+        // An explicit links-only flag downgrades it again.
+        repo.breeze_ok(&["guard", "install", "--with-post-checkout"]);
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("breeze-checkout-apply"), "{contents}");
+        assert!(contents.contains("sync --all --links-only"), "{contents}");
+        let status = repo.breeze_ok(&["guard", "status"]);
+        assert!(
+            status.contains("post-checkout: installed (links only)"),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn apply_on_checkout_applies_shared_patches_to_a_new_worktree() {
+        let repo = TempRepo::new("guard-apply-worktree");
+        commit_file(&repo, "fog.json", "base\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+        let editor = write_editor(
+            &repo,
+            "guard-apply-worktree-edit",
+            "printf 'base\\nlocal\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        let third = repo.base.join("wt3");
+        git_ok(
+            &repo,
+            &repo.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "guard-third",
+                third.to_str().unwrap(),
+                "main",
+            ],
+        );
+        assert_eq!(repo.read(&third, "fog.json"), "base\nlocal\n");
+
+        git_ok(
+            &repo,
+            &repo.main,
+            &["worktree", "remove", "--force", third.to_str().unwrap()],
+        );
+    }
+
+    #[test]
+    fn apply_on_checkout_swaps_branch_layer_patches_on_switch() {
+        let repo = TempRepo::new("guard-apply-switch");
+        commit_file(&repo, "fog.json", "base\n");
+        let main_editor =
+            write_editor(&repo, "guard-apply-main", "printf 'main-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &main_editor,
+        ]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_editor =
+            write_editor(&repo, "guard-apply-side", "printf 'side-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &side_editor,
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        git_ok(&repo, &repo.main, &["switch", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "side-local\n");
+
+        git_ok(&repo, &repo.main, &["switch", "main"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        git_ok(&repo, &repo.main, &["switch", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "side-local\n");
+    }
+
+    #[test]
+    fn apply_on_checkout_restores_an_inactive_patch_on_a_branch_without_one() {
+        let repo = TempRepo::new("guard-apply-prune");
+        commit_file(&repo, "fog.json", "base\n");
+        let editor = write_editor(
+            &repo,
+            "guard-apply-prune-main",
+            "printf 'main-local\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "branch", "--editor", &editor]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        repo.write("side.txt", "side\n");
+        repo.git(&repo.main, &["add", "side.txt"]);
+        repo.git(&repo.main, &["commit", "-m", "side commit"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        git_ok(&repo, &repo.main, &["switch", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+
+        git_ok(&repo, &repo.main, &["switch", "main"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+    }
+
+    #[test]
+    fn apply_on_checkout_prunes_when_switching_at_the_same_commit() {
+        let repo = TempRepo::new("guard-apply-same-commit");
+        commit_file(&repo, "fog.json", "base\n");
+        let editor = write_editor(
+            &repo,
+            "guard-apply-same-commit-edit",
+            "printf 'main-local\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "branch", "--editor", &editor]);
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        // A new branch at the same commit has no branch-layer patch of its own.
+        git_ok(&repo, &repo.main, &["switch", "-c", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+
+        git_ok(&repo, &repo.main, &["switch", "main"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        // Switching between two existing branches at the same commit must not
+        // leave main's patched content attached to side.
+        git_ok(&repo, &repo.main, &["switch", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+    }
+
+    #[test]
+    fn apply_on_checkout_stays_links_only_during_rebase() {
+        let repo = TempRepo::new("guard-apply-rebase");
+        record_patch_at_base(&repo, "guard-apply-rebase-edit");
+        fs::write(repo.other.join("feature.txt"), "feature\n").unwrap();
+        repo.git(&repo.other, &["add", "feature.txt"]);
+        repo.git(&repo.other, &["commit", "-m", "feature"]);
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        git_ok(&repo, &repo.main, &["rebase", "feature"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+        assert_patch_active(&repo);
+    }
+
+    #[test]
+    fn apply_on_checkout_stays_links_only_during_bisect() {
+        let repo = TempRepo::new("guard-apply-bisect");
+        record_patch_at_base(&repo, "guard-apply-bisect-edit");
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+        fs::write(repo.main.join(".git/BISECT_START"), "main\n").unwrap();
+
+        let output = Command::new(hook(&repo, "post-checkout"))
+            .args(["old", "new", "1"])
+            .current_dir(&repo.main)
+            .env("XDG_DATA_HOME", &repo.data)
+            .env("XDG_CACHE_HOME", repo.base.join("cache"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+    }
+
+    #[test]
+    fn apply_on_checkout_skips_file_checkouts() {
+        let repo = TempRepo::new("guard-apply-file");
+        record_patch_at_base(&repo, "guard-apply-file-edit");
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\nlocal\n");
+
+        git_ok(&repo, &repo.main, &["checkout", "--", "fog.json"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+    }
+
+    #[test]
+    fn apply_on_checkout_syncs_the_worktree_being_checked_out() {
+        let repo = TempRepo::new("guard-apply-linked");
+        commit_file(&repo, "fog.json", "base\n");
+        repo.git(&repo.other, &["reset", "--hard", "main"]);
+        let editor = write_editor(
+            &repo,
+            "guard-apply-linked-edit",
+            "printf 'base\\nlocal\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&["edit", "fog.json", "--layer", "shared", "--editor", &editor]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
+
+        git_ok(&repo, &repo.other, &["switch", "-c", "feature2"]);
+        assert_eq!(repo.read(&repo.other, "fog.json"), "base\nlocal\n");
+        assert_eq!(
+            repo.read(&repo.main, "fog.json"),
+            "base\n",
+            "the hook must sync the checked-out worktree, not the main worktree"
         );
     }
 }
