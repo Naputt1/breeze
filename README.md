@@ -75,11 +75,11 @@ Global flags accepted by every command:
 | `breeze init` | Create the Breeze store for the repository. Safe to rerun. |
 | `breeze status [--json]` | Show repository, worktree, store and overlay status. `--json` includes per-override `path`/`mode`/`layer`/`source`/`name`, stale patches, and a doctor-lite `issues` count. Named patches are shown as `name (path)`. |
 | `breeze link <PATH> [--layer shared\|branch\|worktree] [--all-worktrees]` | Link an untracked file. The default layer is `shared`; `branch` and `worktree` override it locally. `--all-worktrees` is accepted for compatibility; a link already applies to every worktree its layer covers. |
-| `breeze unlink <PATH> [--force]` | Remove link overrides and restore real files. `--force` allows replacing locally modified copies, with a backup. |
+| `breeze unlink <PATH> [--force]` | Remove the link overrides that apply to the current branch/worktree and restore real files; overrides recorded for other branches or worktrees stay. `--force` allows replacing locally modified copies, with a backup. |
 | `breeze edit <PATH> [--layer shared\|branch\|worktree] [--editor <CMD>] [--name <NAME>]` | Edit a tracked file and record the result as a patch (default layer `branch`; filter mode uses only `shared`). `--name` sets or updates a repository-unique patch name (`[a-z0-9][a-z0-9._-]{0,63}`), stored in both the override and patch metadata. |
-| `breeze sync [--all] [--path <PATH>] [--dry-run] [--links-only] [--prune-inactive]` | Repair symlinks and re-apply patches. In filter mode it never writes patches into the worktree; it dry-runs each smudge merge and reports deferred patches. `--links-only` repairs links without applying tracked patches. `--prune-inactive` restores HEAD content where a file still carries a patch that does not apply to this branch or worktree. Defaults to the current worktree; `--all` covers every worktree. |
+| `breeze sync [--all] [--path <PATH>] [--dry-run] [--links-only] [--prune-inactive]` | Repair symlinks and re-apply patches. In filter mode it never writes patches into the worktree; it dry-runs each smudge merge and reports deferred patches. `--links-only` repairs links without applying tracked patches. `--prune-inactive` restores HEAD content where a file still carries a patch that does not apply to this branch or worktree and HEAD has the path, and removes a link that points into another branch's or worktree's store when no link applies here; staged content is left alone (and reported as a conflict if a target patch would be applied on top). Defaults to the current worktree; `--all` covers every worktree. `--links-only` and `--prune-inactive` cannot be combined. |
 | `breeze diff [PATH] [--stat]` | Show changes between overlays and the working tree. Named patches use a `# patch: <name> (<layer>, <path>)` header. |
-| `breeze revert [<PATH>] [--name <NAME>] [--all] [--force]` | Archive the patch that applies in the current branch/worktree, or every applicable patch with `--all`, to `<layer>/backups/patches/`; then remove those overlays and restore tracked content. Patches recorded for other branches or worktrees stay in place. |
+| `breeze revert [<PATH>] [--name <NAME>] [--all] [--force]` | Archive every patch that applies to the path in the current branch/worktree (shared and branch/worktree layers), or every applicable patch with `--all`, to `<layer>/backups/patches/`; then remove those overlays and restore tracked content. Patches recorded for other branches or worktrees stay in place. |
 | `breeze restore <NAME> [--layer <LAYER>]` | Re-apply an archived patch by name and record it again. Use `--layer` when the name is archived in more than one layer. |
 | `breeze patches [--json]` | List active and archived patches with name, path, layer, staleness and archive state. Read-only. |
 | `breeze promote <PATH>` | Turn a recorded patch into ordinary tracked content, ready to commit. The patch is archived first. |
@@ -93,7 +93,7 @@ Global flags accepted by every command:
 | `breeze filter enable` | Opt this repository into filter mode: write the managed `.git/info/attributes` block and repo-local `filter.breeze` config, capture patched contents, and re-checkout registered paths. Refuses branch or worktree patch records (shared layer only). Safe to rerun. |
 | `breeze filter disable` | Remove the attributes block and filter config and re-checkout registered paths to plain upstream content. Patch records are kept. |
 | `breeze filter status` | Report whether filter mode is enabled, the configured binary and its presence, registered paths, and deferred patches. |
-| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions, missing worktrees, and filter mode (deferred patches, captured content, binary, attributes/config). `--fix` repairs what it safely can. Named patches are identified as `name (path)`. |
+| `breeze doctor [--fix]` | Check links, patches, stale bases, duplicates, permissions, missing worktrees, and filter mode (deferred patches, captured content, binary, attributes/config). Stored patch data is validated for every recorded branch and worktree, not only the active one; stale bases and duplicates are reported for the current target. `--fix` repairs what it safely can. Named patches are identified as `name (path)`. |
 | `breeze gc [--force]` | Remove store data for worktrees that no longer exist, stale fog temp configs, empty directories and orphan patches. Archived patches are reported but never deleted. `--force` also deletes unused store files and keeps only the five newest backups per repository. |
 | `breeze version` | Print the version. |
 | `breeze completions <bash\|zsh\|fish>` | Print a completion script (hidden helper). |
@@ -133,6 +133,10 @@ because the clean filter already stages unpatched content; link paths remain
 protected. `pre-rebase` also allows the rebase, since smudge re-merges patches
 after the rewrite.
 
+The `pre-commit` and `pre-push` hooks match any path with a recorded patch,
+even one recorded only for another branch or worktree. That can block the path
+on a branch where no patch applies; the extra check errs on the safe side.
+
 The sync and guard hooks embed the absolute path of the `breeze` binary that
 installed them and the main worktree root, shell-quoted, and never look up
 `breeze` on `PATH`; `pre-rebase` uses the worktree Git is rebasing. A GUI or IDE Git launch with a minimal environment therefore
@@ -163,9 +167,10 @@ attention; run breeze doctor`, and the apply-mode and full-sync hooks print
   do nothing. In the default links-only mode it repairs links and never applies
   tracked patches. In apply mode (`--apply-on-checkout`) it runs `breeze sync`
   for the worktree being checked out, which also applies that branch's patches
-  and restores content left behind by a previous branch's patch. It adds
-  `--prune-inactive` only when HEAD actually moved, so `git switch -c` at the
-  same commit keeps the current overlay with the new branch. It still watches
+  and restores content left behind by a previous branch's patch. It always
+  passes `--prune-inactive` on a user checkout, so switching between branches
+  at the same commit cannot leave the old branch's patched content attached to
+  the new one. It still watches
   for Git's internal checkouts: while `rebase-merge`, `rebase-apply`,
   `sequencer`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `MERGE_HEAD` or
   `BISECT_START` is present, it repairs links only. A new worktree checkout
@@ -291,7 +296,7 @@ Filter mode is deliberately narrow in this prototype:
 
 `sync` means a full `breeze sync --all`. In links-only mode `post-checkout`
 runs `breeze sync --all --links-only` and never applies tracked patches. In
-apply mode it runs `breeze sync [--prune-inactive]` for the worktree being
+apply mode it runs `breeze sync --prune-inactive` for the worktree being
 checked out, and falls back to links-only during Git's internal checkouts.
 "none" means there is no safe Git hook for that operation and Breeze does not
 claim coverage.
@@ -306,7 +311,7 @@ claim coverage.
 | `pull --rebase` | `post-checkout` (links only in apply mode), `post-rewrite`; `pre-rebase` if installed | Repairs links at the rebase checkout, then full sync after a successful rebase. | Conflicts/aborts run no post hook; dirty patches usually stop Git before `pre-rebase`. |
 | `rebase` success | `post-checkout` (links only in apply mode), `post-rewrite` | Repairs links, then full sync after the rewrite. | Patch may conflict; resolve, then `breeze edit` to refresh its base. |
 | `rebase` conflict/abort | `post-checkout` (links only in apply mode); `pre-rebase` before; none after | `pre-rebase` can block only if Git reaches it; the rebase checkout repairs links only. | No sync after abort; run `breeze sync --all`. |
-| `checkout`/`switch` | `post-checkout` (arg `1`) | Links-only mode repairs links. Apply mode also applies the target branch's patches and removes an inactive branch patch. | Run `breeze sync` in links-only mode; dirty patches can still make checkout abort before the hook. |
+| `checkout`/`switch` | `post-checkout` (arg `1`) | Links-only mode repairs links. Apply mode also applies the target branch's patches and restores content left by an inactive branch patch (the record stays and re-applies when you return). | Run `breeze sync` in links-only mode; dirty patches can still make checkout abort before the hook. |
 | `checkout -- <file>` | `post-checkout` (arg `0`) | Intentionally does nothing. | Patch record stays active while the file is back at HEAD; use `breeze revert <file>`. |
 | `restore` | `post-checkout` (arg `0`) | Intentionally does nothing. | Same as above. |
 | `reset --hard` | none | — | Discards patched content; the patch record remains; use `breeze revert --force`. |
@@ -355,11 +360,20 @@ These apply to patch mode unless a bullet says filter mode.
 - With the default links-only `post-checkout`, branch and worktree checkouts
   repair links but do not reapply tracked patches; run `breeze sync` (or
   `breeze sync --all`) after switching. Apply mode re-applies the target
-  branch's patches and removes a branch patch that no longer applies, but only
-  when the file content exactly matches a recorded applied hash. User edits,
-  staged content and filter mode are left alone.
+  branch's patches and restores content left by a branch patch that no longer
+  applies, but only when the file content exactly matches a recorded applied
+  hash. User edits, staged content and filter mode are left alone; if a target
+  patch would otherwise be applied on top of staged foreign content, sync
+  reports a conflict instead. Restoring needs the inactive patch's record and
+  metadata; once that patch is reverted, promoted or garbage-collected,
+  identical content can no longer be attributed to it and is left alone.
 - `git clean -fdx` and `git clean -fdX` delete ignored link symlinks. Run
   `breeze sync --all` to recreate them from the store.
+- Branch and worktree layers are keyed by branch and worktree identity. Renaming
+  or moving one makes its records inapplicable: `sync --prune-inactive` then
+  removes its links and restores patch content, although the store copies stay
+  under the old identity and switching back to the old name recovers them. In a
+  detached HEAD no branch-layer entry applies.
 - `git reset --hard`, `git restore` and `git checkout -- <file>` can discard
   tracked patch content. The patch record is not automatically dropped; use
   `breeze revert <file>` to archive and remove it, `breeze restore <name>` to
@@ -480,8 +494,8 @@ and kept in step with the shared patch records by `edit`, `revert`, `promote`,
   `breeze sync --all --links-only` and repairs links without applying tracked
   patches, because Git invokes it for internal rebase, cherry-pick and revert
   checkouts. Apply mode (`--apply-on-checkout`) runs `breeze sync` for the
-  worktree being checked out, adds `--prune-inactive` only when HEAD moved,
-  and falls back to links-only while Git operation state is present. The other
+  worktree being checked out, always passes `--prune-inactive`, and falls back
+  to links-only while Git operation state is present. The other
   three run a full `breeze sync --all`. All are best effort and always exit
   `0`; a failing or conflicting sync only prints a warning, so checkouts,
   pulls, rebases, amends and `git am` never fail because of Breeze. They embed

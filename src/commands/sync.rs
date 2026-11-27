@@ -18,6 +18,13 @@ use crate::store::overrides::{OverrideEntry, OverrideMode};
 use crate::store::patches;
 
 pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
+    if args.links_only && args.prune_inactive {
+        return Err(crate::exit::CommandError::new(
+            exit::USAGE,
+            "`--prune-inactive` cannot be combined with `--links-only`",
+        )
+        .into());
+    }
     let repo = Repo::open(ctx)?;
     let overrides = repo.overrides()?;
     let (mut links, mut patches): (Vec<OverrideEntry>, Vec<OverrideEntry>) = overrides
@@ -119,16 +126,53 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
         }
     }
 
+    let mut warned = false;
     for path in &entry_paths(&links) {
         let path_entries: Vec<&OverrideEntry> =
             links.iter().filter(|entry| &entry.path == path).collect();
 
         for target in &targets {
+            let link = target.path.join(path);
             let Some(entry) = overlay::best_entry(path_entries.iter().copied(), target) else {
+                // A branch switch can leave a link pointing into another
+                // branch's private store copy. It must not stay readable here.
+                let inactive_store = path_entries
+                    .iter()
+                    .map(|entry| repo.layout.repo_dir.join(&entry.source))
+                    .find(|store| overlay::link_points_to(&link, store));
+                let Some(store) = inactive_store else {
+                    continue;
+                };
+                if !args.prune_inactive {
+                    println!(
+                        "WARN {}: link overlay does not apply here; run `breeze sync --prune-inactive` to remove it",
+                        link.display()
+                    );
+                    warned = true;
+                    continue;
+                }
+                if args.dry_run {
+                    println!(
+                        "would remove inactive link {} (it points at {})",
+                        link.display(),
+                        store.display()
+                    );
+                    changes += 1;
+                    continue;
+                }
+                match fs::remove_file(&link) {
+                    Ok(()) => {
+                        println!("removed inactive link {}", link.display());
+                        changes += 1;
+                    }
+                    Err(err) => {
+                        eprintln!("error: failed to remove {}: {err}", link.display());
+                        failures += 1;
+                    }
+                }
                 continue;
             };
             let store_file = repo.layout.repo_dir.join(&entry.source);
-            let link = target.path.join(path);
 
             if !Repo::is_regular_store_file(&store_file) {
                 eprintln!(
@@ -202,7 +246,7 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<i32> {
         }
     }
 
-    if changes == 0 && failures == 0 && conflicts == 0 && !ctx.quiet {
+    if changes == 0 && failures == 0 && conflicts == 0 && !warned && !ctx.quiet {
         println!("all overlays ok");
     }
 
@@ -239,7 +283,7 @@ fn sync_patch(
         if !prune_inactive {
             return Ok(PatchChange::Unchanged);
         }
-        return if restore_inactive(
+        return match restore_inactive(
             repo,
             path,
             entries,
@@ -248,9 +292,15 @@ fn sync_patch(
             target,
             dry_run,
         )? {
-            Ok(PatchChange::Restored)
-        } else {
-            Ok(PatchChange::Unchanged)
+            InactiveRestore::Restored => Ok(PatchChange::Restored),
+            InactiveRestore::NotNeeded => Ok(PatchChange::Unchanged),
+            InactiveRestore::Blocked(reason) => {
+                eprintln!(
+                    "WARN {path} in {}: {reason}; left untouched",
+                    target.path.display()
+                );
+                Ok(PatchChange::Unchanged)
+            }
         };
     };
 
@@ -271,7 +321,7 @@ fn sync_patch(
     // A branch switch can leave another layer's patch content in the file.
     // Restore the target's HEAD content before applying this patch so the
     // three-way merge starts from the branch's real base.
-    restore_inactive(
+    match restore_inactive(
         repo,
         path,
         entries,
@@ -279,7 +329,16 @@ fn sync_patch(
         current_hash.as_deref(),
         target,
         dry_run,
-    )?;
+    )? {
+        InactiveRestore::Blocked(reason) => {
+            eprintln!(
+                "WARN {path} in {}: {reason}; skipped applying the target patch",
+                target.path.display()
+            );
+            return Ok(PatchChange::Conflict);
+        }
+        InactiveRestore::NotNeeded | InactiveRestore::Restored => {}
+    }
 
     if dry_run {
         println!("would apply patch {path} in {}", target.path.display());
@@ -308,12 +367,23 @@ fn sync_patch(
     }
 }
 
+enum InactiveRestore {
+    /// Nothing to restore; the target patch (if any) may be applied.
+    NotNeeded,
+    /// HEAD content was restored, or would be in a dry run.
+    Restored,
+    /// The file carries another patch's content, but restoring it would
+    /// discard staged or otherwise unsafe content. The caller must not apply
+    /// the target patch on top of it.
+    Blocked(String),
+}
+
 /// Restore `path` to the target's HEAD content when it still carries the
 /// output of a patch other than `best`.
 ///
 /// The hash comparison is deliberately exact: content that a user changed is
 /// left alone. Returns whether the file was (or, in a dry run, would be)
-/// restored.
+/// restored, or why it could not be restored safely.
 fn restore_inactive(
     repo: &Repo,
     path: &str,
@@ -322,33 +392,42 @@ fn restore_inactive(
     current_hash: Option<&str>,
     target: &overlay::WorktreeTarget,
     dry_run: bool,
-) -> Result<bool> {
+) -> Result<InactiveRestore> {
     let Some(current_hash) = current_hash else {
-        return Ok(false);
+        return Ok(InactiveRestore::NotNeeded);
     };
     if !carries_other_patch(repo, entries, best, current_hash) {
-        return Ok(false);
+        return Ok(InactiveRestore::NotNeeded);
     }
 
     let file = target.path.join(path);
     let metadata = match fs::symlink_metadata(&file) {
         Ok(metadata) => metadata,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(InactiveRestore::NotNeeded),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Ok(false);
+        return Ok(InactiveRestore::Blocked("not a regular file".to_string()));
     }
     // Never rewrite a worktree file that has staged changes.
     if has_staged_changes(&target.path, path)? {
-        return Ok(false);
+        return Ok(InactiveRestore::Blocked(
+            "the file has staged changes".to_string(),
+        ));
     }
 
     let Some(head_blob) = patches::head_blob(&target.path, path)? else {
-        return Ok(false);
+        // With no target patch there is nothing to apply, and deleting an
+        // untracked file on this branch would lose data. With a target patch,
+        // HEAD is the merge base and its absence is unexpected.
+        return Ok(if best.is_some() {
+            InactiveRestore::Blocked("the path is not in HEAD".to_string())
+        } else {
+            InactiveRestore::NotNeeded
+        });
     };
     let head = patches::blob_content(&target.path, &head_blob)?;
     if patches::hash_bytes(&head) == current_hash {
-        return Ok(false);
+        return Ok(InactiveRestore::NotNeeded);
     }
 
     if dry_run {
@@ -356,7 +435,7 @@ fn restore_inactive(
             "would restore {path} in {} (patch is not active here)",
             target.path.display()
         );
-        return Ok(true);
+        return Ok(InactiveRestore::Restored);
     }
 
     patches::write_worktree_file(&file, &head)?;
@@ -364,7 +443,7 @@ fn restore_inactive(
         "restored {path} in {} (patch is not active here)",
         target.path.display()
     );
-    Ok(true)
+    Ok(InactiveRestore::Restored)
 }
 
 /// Whether `current_hash` matches the recorded applied hash of a patch other
@@ -650,5 +729,99 @@ mod tests {
         repo.git(&repo.main, &["reset", "HEAD", "--", "fog.json"]);
         repo.breeze_ok(&["sync", "--prune-inactive"]);
         assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+    }
+
+    #[test]
+    fn sync_does_not_apply_a_target_patch_over_staged_foreign_content() {
+        let repo = TempRepo::new("sync-staged-foreign");
+        commit_file(&repo, "fog.json", "base\n");
+        let main_editor =
+            write_editor(&repo, "sync-staged-main", "printf 'main-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &main_editor,
+        ]);
+
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let side_editor =
+            write_editor(&repo, "sync-staged-side", "printf 'side-local\\n' > \"$1\"");
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &side_editor,
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        // Carry main's applied patch into side and stage it before syncing.
+        repo.git(&repo.main, &["switch", "side"]);
+        repo.git(&repo.main, &["add", "fog.json"]);
+
+        let (code, stderr) = repo.breeze_err(&["sync"]);
+        assert_eq!(code, 3, "{stderr}");
+        assert!(stderr.contains("staged changes"), "{stderr}");
+        assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+        assert_eq!(repo.git(&repo.main, &["show", ":fog.json"]), "main-local\n");
+    }
+
+    #[test]
+    fn sync_rejects_prune_inactive_with_links_only() {
+        let repo = TempRepo::new("sync-prune-links-only");
+        repo.breeze_ok(&["init"]);
+        let (code, stderr) = repo.breeze_err(&["sync", "--links-only", "--prune-inactive"]);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("cannot be combined"), "{stderr}");
+    }
+
+    #[test]
+    fn sync_prune_inactive_removes_a_foreign_branch_link() {
+        let repo = TempRepo::new("sync-prune-link");
+        repo.write("config/local.toml", "side secret\n");
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        // The link still points into side's private store and leaks its content.
+        assert_eq!(repo.read(&repo.main, "config/local.toml"), "side secret\n");
+        let warned = repo.breeze_ok(&["sync"]);
+        assert!(warned.contains("does not apply here"), "{warned}");
+        assert!(!warned.contains("all overlays ok"), "{warned}");
+        let output = repo.breeze_ok(&["sync", "--prune-inactive"]);
+        assert!(output.contains("removed inactive link"), "{output}");
+        assert!(!repo.main.join("config/local.toml").exists());
+
+        repo.git(&repo.main, &["switch", "side"]);
+        repo.breeze_ok(&["sync"]);
+        assert_eq!(repo.read(&repo.main, "config/local.toml"), "side secret\n");
+    }
+
+    #[test]
+    fn sync_prune_inactive_removes_a_dangling_branch_link() {
+        let repo = TempRepo::new("sync-prune-dangling-link");
+        repo.write("config/local.toml", "side secret\n");
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        let store = repo
+            .store_dir()
+            .join("branches")
+            .join(repo.branch_id(&repo.main))
+            .join("files/config/local.toml");
+        repo.git(&repo.main, &["switch", "main"]);
+
+        // Moving or deleting a store copy leaves the symlink dangling; it still
+        // points at the store and must be recognised as inactive.
+        fs::remove_file(&store).unwrap();
+        let output = repo.breeze_ok(&["sync", "--prune-inactive"]);
+        assert!(output.contains("removed inactive link"), "{output}");
+        assert!(!repo.main.join("config/local.toml").exists());
     }
 }

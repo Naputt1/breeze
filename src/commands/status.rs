@@ -68,13 +68,14 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
         let (links, patches) = overrides.counts();
         println!("overlays:  {links} link(s), {patches} patch(es)");
 
+        let current = repo.current_target();
         if !overrides.overrides.is_empty() {
-            print_group("Linked", "shared", &linked, &deferred_set);
-            print_group("Linked", "branch", &linked, &deferred_set);
-            print_group("Linked", "worktree", &linked, &deferred_set);
-            print_group("Patches", "shared", &patched, &deferred_set);
-            print_group("Patches", "branch", &patched, &deferred_set);
-            print_group("Patches", "worktree", &patched, &deferred_set);
+            print_group("Linked", "shared", &linked, &deferred_set, &current);
+            print_group("Linked", "branch", &linked, &deferred_set, &current);
+            print_group("Linked", "worktree", &linked, &deferred_set, &current);
+            print_group("Patches", "shared", &patched, &deferred_set, &current);
+            print_group("Patches", "branch", &patched, &deferred_set, &current);
+            print_group("Patches", "worktree", &patched, &deferred_set, &current);
         }
 
         if !deferred.is_empty() {
@@ -84,9 +85,14 @@ pub fn run(ctx: &Ctx) -> Result<i32> {
             let labels: Vec<String> = stale
                 .iter()
                 .map(|path| {
-                    patched
+                    let applicable: Vec<&OverrideEntry> = patched
                         .iter()
-                        .find(|entry| entry.path == *path)
+                        .copied()
+                        .filter(|entry| {
+                            entry.path == *path && overlay::entry_applies(entry, &current)
+                        })
+                        .collect();
+                    overlay::best_entry(applicable.iter().copied(), &current)
                         .map(|entry| entry.label())
                         .unwrap_or_else(|| path.clone())
                 })
@@ -112,12 +118,20 @@ fn view(entry: &OverrideEntry) -> Value {
     })
 }
 
-fn print_group(label: &str, layer: &str, entries: &[&OverrideEntry], deferred: &BTreeSet<String>) {
+fn print_group(
+    label: &str,
+    layer: &str,
+    entries: &[&OverrideEntry],
+    deferred: &BTreeSet<String>,
+    current: &overlay::WorktreeTarget,
+) {
     let labels: Vec<String> = entries
         .iter()
         .filter(|entry| entry.layer == layer)
         .map(|entry| {
-            if deferred.contains(&entry.path) {
+            if !overlay::entry_applies(entry, current) {
+                format!("{} [other branch/worktree]", entry.label())
+            } else if deferred.contains(&entry.path) {
                 format!("{} [deferred]", entry.label())
             } else {
                 entry.label()
@@ -187,7 +201,14 @@ fn count_issues(repo: &Repo, links: &[&OverrideEntry]) -> Result<usize> {
             .collect();
 
         for target in &targets {
+            let link = target.path.join(path);
             let Some(entry) = overlay::best_entry(entries.iter().copied(), target) else {
+                let inactive = entries.iter().any(|entry| {
+                    overlay::link_points_to(&link, &repo.layout.repo_dir.join(&entry.source))
+                });
+                if inactive {
+                    issues += 1;
+                }
                 continue;
             };
             let store_file = repo.layout.repo_dir.join(&entry.source);
@@ -196,7 +217,6 @@ fn count_issues(repo: &Repo, links: &[&OverrideEntry]) -> Result<usize> {
                 continue;
             }
 
-            let link = target.path.join(path);
             let ok = match fs::symlink_metadata(&link) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     overlay::link_points_to(&link, &store_file)
@@ -327,5 +347,41 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("issues:              0"), "{output}");
+    }
+
+    #[test]
+    fn human_status_marks_patches_recorded_for_another_branch() {
+        let repo = TempRepo::new("status-other-branch");
+        commit_file(&repo, "fog.json", "base\n");
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        let editor = write_editor(
+            &repo,
+            "status-other-branch-edit",
+            "printf 'side-local\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit", "fog.json", "--layer", "branch", "--name", "sidep", "--editor", &editor,
+        ]);
+        repo.git(&repo.main, &["checkout", "--", "fog.json"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        let output = repo.breeze_ok(&["status"]);
+        assert!(
+            output.contains("sidep (fog.json) [other branch/worktree]"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn status_counts_a_link_left_by_another_branch() {
+        let repo = TempRepo::new("status-foreign-link");
+        repo.write("config/local.toml", "side secret\n");
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        let output = repo.breeze_ok(&["status", "--json"]);
+        let value: Value = serde_json::from_str(&output).expect("parse status json");
+        assert_eq!(value["issues"], 1, "{output}");
     }
 }

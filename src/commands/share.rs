@@ -33,21 +33,16 @@ pub fn run(ctx: &Ctx, args: &ShareArgs) -> Result<i32> {
         .into());
     }
 
-    // Prefer the override that actually applies here; fall back to the highest
-    // layer recorded for the path when none matches the current worktree.
-    let chosen = match overlay::best_entry(entries.iter(), &current) {
-        Some(entry) => entry.clone(),
-        None => entries
-            .iter()
-            .max_by_key(|entry| Layer::from_name(&entry.layer))
-            .cloned()
-            .ok_or_else(|| {
-                CommandError::new(
-                    exit::GENERAL,
-                    format!("could not resolve an overlay for `{relative}`"),
-                )
-            })?,
-    };
+    // Only move an override that applies here. Picking another branch's or
+    // worktree's entry would leak its private file into the shared layer.
+    let chosen = overlay::best_entry(entries.iter(), &current)
+        .cloned()
+        .ok_or_else(|| {
+            CommandError::new(
+                exit::USAGE,
+                format!("no overlay for `{relative}` applies to this branch or worktree"),
+            )
+        })?;
 
     if chosen.layer == Layer::Shared.name() {
         if !ctx.quiet {

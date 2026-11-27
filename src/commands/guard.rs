@@ -629,15 +629,12 @@ if [ "$3" = "1" ]; then
           fi
         done
         if [ "$internal" = "0" ]; then
-          # Prune only when HEAD actually moved. `switch -c` at the same
-          # commit keeps a branch-layer overlay with the new branch.
-          if [ "$1" = "$2" ]; then
-            "$BREEZE" --repo "$TARGET" --quiet sync >/dev/null 2>&1 || \
-              printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
-          else
-            "$BREEZE" --repo "$TARGET" --quiet sync --prune-inactive >/dev/null 2>&1 || \
-              printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
-          fi
+          # Always prune: the checked-out branch may already have moved even
+          # when the commit did not (`git switch` between branches at the same
+          # commit). Content from a patch recorded for the old branch must not
+          # stay attached to the new one.
+          "$BREEZE" --repo "$TARGET" --quiet sync --prune-inactive >/dev/null 2>&1 || \
+            printf 'breeze: patch sync needs attention; run breeze doctor\n' >&2
         else
           "$BREEZE" --repo "$TARGET" --quiet sync --links-only >/dev/null 2>&1 || \
             printf 'breeze: overlay sync needs attention; run breeze doctor\n' >&2
@@ -1913,19 +1910,28 @@ mod tests {
     }
 
     #[test]
-    fn apply_on_checkout_keeps_the_overlay_when_creating_a_branch_at_the_same_commit() {
-        let repo = TempRepo::new("guard-apply-new-branch");
+    fn apply_on_checkout_prunes_when_switching_at_the_same_commit() {
+        let repo = TempRepo::new("guard-apply-same-commit");
         commit_file(&repo, "fog.json", "base\n");
         let editor = write_editor(
             &repo,
-            "guard-apply-new-branch-edit",
+            "guard-apply-same-commit-edit",
             "printf 'main-local\\n' > \"$1\"",
         );
         repo.breeze_ok(&["edit", "fog.json", "--layer", "branch", "--editor", &editor]);
         repo.breeze_ok(&["guard", "install", "--apply-on-checkout"]);
 
+        // A new branch at the same commit has no branch-layer patch of its own.
         git_ok(&repo, &repo.main, &["switch", "-c", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
+
+        git_ok(&repo, &repo.main, &["switch", "main"]);
         assert_eq!(repo.read(&repo.main, "fog.json"), "main-local\n");
+
+        // Switching between two existing branches at the same commit must not
+        // leave main's patched content attached to side.
+        git_ok(&repo, &repo.main, &["switch", "side"]);
+        assert_eq!(repo.read(&repo.main, "fog.json"), "base\n");
     }
 
     #[test]

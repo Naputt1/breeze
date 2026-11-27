@@ -40,11 +40,32 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
             .collect();
 
         for target in &targets {
+            let link = target.path.join(path);
             let Some(entry) = overlay::best_entry(path_entries.iter().copied(), target) else {
+                let inactive_store = path_entries
+                    .iter()
+                    .map(|entry| repo.layout.repo_dir.join(&entry.source))
+                    .find(|store| overlay::link_points_to(&link, store));
+                if inactive_store.is_some() {
+                    if args.fix {
+                        fs::remove_file(&link)
+                            .with_context(|| format!("failed to remove {}", link.display()))?;
+                        println!(
+                            "FIXED {path} removed inactive link in {}",
+                            target.path.display()
+                        );
+                        fixed += 1;
+                    } else {
+                        println!(
+                            "BROKEN {path} link belongs to an override that does not apply in {}",
+                            target.path.display()
+                        );
+                        problems += 1;
+                    }
+                }
                 continue;
             };
             let store_file = repo.layout.repo_dir.join(&entry.source);
-            let link = target.path.join(path);
 
             if !Repo::is_regular_store_file(&store_file) {
                 println!(
@@ -189,6 +210,50 @@ pub fn run(ctx: &Ctx, args: &DoctorArgs) -> Result<i32> {
 /// Check stored patches for missing data, duplicate layers and a stale base.
 fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
     let target = repo.current_target();
+    let mut problems = 0usize;
+
+    // Validate every recorded patch, including entries that belong to another
+    // branch or worktree. `sync` and the hooks send users to `doctor`, so a
+    // broken store file must be reported wherever it is recorded.
+    let mut seen_sources: HashSet<String> = HashSet::new();
+    let mut valid_sources: HashSet<String> = HashSet::new();
+    for entry in overrides
+        .overrides
+        .iter()
+        .filter(|entry| entry.mode == OverrideMode::Patch)
+    {
+        if !seen_sources.insert(entry.source.clone()) {
+            continue;
+        }
+        let label = entry.label();
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        if !Repo::is_regular_store_file(&patch_file) {
+            println!(
+                "BROKEN {label} patch file is missing or is not a regular file: {}",
+                patch_file.display()
+            );
+            problems += 1;
+            continue;
+        }
+        let meta_path = match patches::metadata_path_for(&patch_file) {
+            Ok(path) => path,
+            Err(err) => {
+                println!("BROKEN {label} patch metadata path is invalid: {err}");
+                problems += 1;
+                continue;
+            }
+        };
+        if patches::read_metadata(&meta_path).is_err() {
+            println!(
+                "BROKEN {label} patch metadata is missing or invalid: {}",
+                meta_path.display()
+            );
+            problems += 1;
+            continue;
+        }
+        valid_sources.insert(entry.source.clone());
+    }
+
     let mut grouped: BTreeMap<String, Vec<&OverrideEntry>> = BTreeMap::new();
     for entry in overrides
         .overrides
@@ -200,8 +265,6 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
         }
         grouped.entry(entry.path.clone()).or_default().push(entry);
     }
-
-    let mut problems = 0usize;
     for (path, entries) in &grouped {
         let best = entries
             .iter()
@@ -210,11 +273,17 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
             .map(|entry| entry.label())
             .unwrap_or_else(|| path.clone());
 
-        if entries.len() > 1 {
-            let layers: Vec<&str> = entries.iter().map(|entry| entry.layer.as_str()).collect();
+        let mut layers: Vec<&str> = entries.iter().map(|entry| entry.layer.as_str()).collect();
+        layers.sort_unstable();
+        let duplicate_layers: Vec<&str> = layers
+            .windows(2)
+            .filter(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+            .collect();
+        if !duplicate_layers.is_empty() {
             println!(
-                "WARN {label} has duplicate patch overrides in layers {}; keep one layer or run `breeze promote {path}`",
-                layers.join(", ")
+                "WARN {label} has more than one patch override in layer {}; keep one",
+                duplicate_layers.join(", ")
             );
             problems += 1;
         }
@@ -222,35 +291,12 @@ fn check_patches(repo: &Repo, overrides: &OverridesFile) -> Result<usize> {
         let Some(entry) = best else {
             continue;
         };
-        let patch_file = repo.layout.repo_dir.join(&entry.source);
-        if !Repo::is_regular_store_file(&patch_file) {
-            println!(
-                "BROKEN {label} patch file is missing or is not a regular file: {}",
-                patch_file.display()
-            );
-            problems += 1;
+        if !valid_sources.contains(&entry.source) {
             continue;
         }
-
-        let meta_path = match patches::metadata_path_for(&patch_file) {
-            Ok(path) => path,
-            Err(err) => {
-                println!("BROKEN {label} patch metadata path is invalid: {err}");
-                problems += 1;
-                continue;
-            }
-        };
-        let metadata = match patches::read_metadata(&meta_path) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                println!(
-                    "BROKEN {label} patch metadata is missing or invalid: {}",
-                    meta_path.display()
-                );
-                problems += 1;
-                continue;
-            }
-        };
+        let patch_file = repo.layout.repo_dir.join(&entry.source);
+        let meta_path = patches::metadata_path_for(&patch_file)?;
+        let metadata = patches::read_metadata(&meta_path)?;
 
         let object_ok = patches::blob_exists(&repo.info.root, &metadata.base_blob).unwrap_or(false);
         let head_blob = patches::head_blob(&repo.info.root, path)?;
@@ -639,5 +685,60 @@ mod tests {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("CONFLICT"), "{stdout}");
         assert_eq!(fs::read_to_string(&other_path).unwrap(), "different\n");
+    }
+
+    #[test]
+    fn doctor_reports_and_fixes_an_inactive_branch_link() {
+        let repo = TempRepo::new("doctor-inactive-link");
+        repo.write("config/local.toml", "side secret\n");
+        repo.git(&repo.main, &["switch", "-c", "side"]);
+        repo.breeze_ok(&["link", "config/local.toml", "--layer", "branch"]);
+        repo.git(&repo.main, &["switch", "main"]);
+
+        let result = repo.breeze(&["doctor"]);
+        assert_eq!(result.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("BROKEN"), "{stdout}");
+        assert!(stdout.contains("does not apply"), "{stdout}");
+
+        let output = repo.breeze_ok(&["doctor", "--fix"]);
+        assert!(output.contains("removed inactive link"), "{output}");
+        assert!(!repo.main.join("config/local.toml").exists());
+        repo.breeze_ok(&["doctor"]);
+    }
+
+    #[test]
+    fn doctor_accepts_stacked_shared_and_branch_patches() {
+        let repo = TempRepo::new("doctor-stacked");
+        crate::commands::edit::tests::commit_file(&repo, "fog.json", "base\n");
+        let shared_editor = crate::commands::edit::tests::write_editor(
+            &repo,
+            "doctor-stacked-shared",
+            "printf 'base\\nshared\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "shared",
+            "--editor",
+            &shared_editor,
+        ]);
+        let branch_editor = crate::commands::edit::tests::write_editor(
+            &repo,
+            "doctor-stacked-branch",
+            "printf 'base\\nshared\\nbranch\\n' > \"$1\"",
+        );
+        repo.breeze_ok(&[
+            "edit",
+            "fog.json",
+            "--layer",
+            "branch",
+            "--editor",
+            &branch_editor,
+        ]);
+
+        let output = repo.breeze_ok(&["doctor"]);
+        assert!(!output.contains("more than one patch override"), "{output}");
     }
 }
